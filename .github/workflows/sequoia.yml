@@ -15,7 +15,7 @@ jobs:
     env:
       FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
       DB_PATH: data/sequoia_v2.db
-      START_DATE: "2025-01-01"
+      START_DATE: "2024-01-01"
 
     steps:
       - name: Checkout repository
