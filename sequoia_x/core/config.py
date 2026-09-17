@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     db_path: str = "data/sequoia_v2.db"
     start_date: str = "2024-01-01"
-    feishu_webhook_url: str  # 必填字段，缺失时抛出 ValidationError
+    feishu_webhook_url: str | None = None
     strategy_webhooks: dict[str, str] = {}
 
     model_config = SettingsConfigDict(
