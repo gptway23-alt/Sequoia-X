@@ -10,14 +10,20 @@ on:
 jobs:
   run-sequoia:
     runs-on: ubuntu-latest
+
+    # 首次历史数据回填可能很慢
     timeout-minutes: 360
 
     env:
-      FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+      GMAIL_USER: ${{ secrets.GMAIL_USER }}
+      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+      GMAIL_TO: ${{ secrets.GMAIL_TO }}
+
       DB_PATH: data/sequoia_v2.db
       START_DATE: "2024-01-01"
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -26,6 +32,13 @@ jobs:
         with:
           python-version: "3.11"
 
+      # 重要：必须先安装程序，再恢复 data 目录
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      # 安装完成后再恢复 SQLite 数据库
       - name: Restore database
         id: restore-db
         uses: actions/cache/restore@v4
@@ -35,19 +48,16 @@ jobs:
           restore-keys: |
             sequoia-db-
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install .
-
       - name: Initialize database if needed
         run: |
           mkdir -p data
+
           if [ ! -f data/sequoia_v2.db ]; then
             echo "Database not found, starting backfill..."
             python main.py --backfill
           else
             echo "Existing database restored."
+            ls -lh data/sequoia_v2.db
           fi
 
       - name: Run Sequoia-X
