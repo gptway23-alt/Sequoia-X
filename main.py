@@ -57,7 +57,13 @@ def main() -> None:
             logger.info("Sequoia-X V2 回填模式运行完成")
             return
 
-        # ── 日常模式：单次 API 补今天 + 策略 + 推送 ──
+        # ── 日常模式：先补齐股票池，再增量补今天 + 策略 + 推送 ──
+        # 兼容旧缓存数据库：若旧版本曾遗漏创业板，升级后会自动回填
+        # 300xxx / 301xxx；后续新上市股票也会自动纳入。
+        missing_count = engine.ensure_supported_universe()
+        if missing_count:
+            logger.info(f"股票池补齐完成，本轮新增/缺失代码 {missing_count} 只")
+
         logger.info("开始拉取最新快照...")
         count = engine.sync_today_bulk()
         logger.info(f"快照同步完成，写入 {count} 只股票")
