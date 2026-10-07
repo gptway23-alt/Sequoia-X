@@ -57,12 +57,54 @@ def main() -> None:
             logger.info("Sequoia-X V2 回填模式运行完成")
             return
 
-        # ── 日常模式：先补齐股票池，再增量补今天 + 策略 + 推送 ──
-        # 兼容旧缓存数据库：若旧版本曾遗漏创业板，升级后会自动回填
-        # 300xxx / 301xxx；后续新上市股票也会自动纳入。
-        missing_count = engine.ensure_supported_universe()
-        if missing_count:
-            logger.info(f"股票池补齐完成，本轮新增/缺失代码 {missing_count} 只")
+     # ── 日常模式：先补齐股票池，再增量补今天 + 策略 + 推送 ──
+# 兼容旧数据库，并显式纳入创业板 300xxx / 301xxx
+
+SUPPORTED_PREFIXES = (
+    "000", "001", "002", "003",      # 深市主板
+    "300", "301",                    # 创业板
+    "600", "601", "603", "605",      # 沪市主板
+    "688", "689",                    # 科创板
+)
+
+logger.info("检查本地股票池完整性...")
+
+all_symbols = [
+    str(symbol).zfill(6)
+    for symbol in engine.get_all_symbols()
+    if str(symbol).zfill(6).startswith(SUPPORTED_PREFIXES)
+]
+
+local_symbols = set(
+    str(symbol).zfill(6)
+    for symbol in engine.get_local_symbols()
+)
+
+missing_symbols = [
+    symbol
+    for symbol in all_symbols
+    if symbol not in local_symbols
+]
+
+if missing_symbols:
+    chinext_count = sum(
+        symbol.startswith(("300", "301"))
+        for symbol in missing_symbols
+    )
+
+    logger.info(
+        f"检测到 {len(missing_symbols)} 只缺失股票，"
+        f"其中创业板 {chinext_count} 只，开始回填..."
+    )
+
+    engine.backfill(missing_symbols)
+
+    logger.info(
+        f"股票池补齐完成，本轮补齐 {len(missing_symbols)} 只股票"
+    )
+else:
+    logger.info("本地股票池已完整，无需补齐")
+  
 
         logger.info("开始拉取最新快照...")
         count = engine.sync_today_bulk()
