@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 import pandas as pd
 
@@ -558,6 +558,7 @@ class DataEngine:
         target_date: str | None = None,
         expected_symbols: set[str] | None = None,
         minimum_coverage: float | None = None,
+        run_quick_check: bool = True,
     ) -> set[str]:
         if not rows:
             return set()
@@ -582,9 +583,10 @@ class DataEngine:
                             f"事务内覆盖率异常: {coverage:.2%} < {threshold:.2%}"
                         )
 
-                integrity = conn.execute("PRAGMA quick_check").fetchone()
-                if not integrity or integrity[0] != "ok":
-                    raise DataIntegrityError(f"SQLite quick_check failed: {integrity}")
+                if run_quick_check:
+                    integrity = conn.execute("PRAGMA quick_check").fetchone()
+                    if not integrity or integrity[0] != "ok":
+                        raise DataIntegrityError(f"SQLite quick_check failed: {integrity}")
                 conn.commit()
                 return verified
             except Exception:
@@ -592,20 +594,24 @@ class DataEngine:
                     conn.rollback()
                 raise
 
-    def _run_fetch_batches(
+    def _iter_fetch_batches(
         self,
         batches: list[list[tuple[str, str, str, str]]],
-    ) -> list[BatchFetchResult]:
-        """并行执行小批次；单个 future 失败只标记该批次。"""
+    ) -> Iterator[BatchFetchResult]:
+        """受控并行抓取，并逐波产出结果。
+
+        调用方可在下一波网络请求完成前处理并落库上一波结果，内存占用因此
+        只与 ``max_workers * batch_size`` 成正比。一个 worker 异常只会标记
+        它负责的小批次；若整波均无法登录，则熔断尚未提交的批次。
+        """
         if not batches:
-            return []
+            return
 
         import multiprocessing
         from concurrent.futures import ProcessPoolExecutor, as_completed
 
         workers = min(self.max_workers, len(batches))
         context = multiprocessing.get_context("spawn")
-        results: list[BatchFetchResult] = []
         with ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
             for offset in range(0, len(batches), workers):
                 wave = batches[offset : offset + workers]
@@ -634,20 +640,25 @@ class DataEngine:
                                 failed_symbols={task[0]: error for task in batch},
                             )
                         )
-                results.extend(wave_results)
+                for result in wave_results:
+                    yield result
 
                 login_errors = [result.login_error for result in wave_results]
                 if wave_results and all(login_errors):
                     error = f"BaoStock 登录或会话失效，停止剩余批次: {login_errors[0]}"
                     for remaining_batch in batches[offset + len(wave) :]:
-                        results.append(
-                            BatchFetchResult(
-                                failed_symbols={task[0]: error for task in remaining_batch},
-                                login_error=error,
-                            )
+                        yield BatchFetchResult(
+                            failed_symbols={task[0]: error for task in remaining_batch},
+                            login_error=error,
                         )
                     break
-        return results
+
+    def _run_fetch_batches(
+        self,
+        batches: list[list[tuple[str, str, str, str]]],
+    ) -> list[BatchFetchResult]:
+        """兼容日行情同步：收集流式批次结果。"""
+        return list(self._iter_fetch_batches(batches))
 
     def sync_today_bulk(
         self,
@@ -802,103 +813,131 @@ class DataEngine:
         )
 
     def backfill(self, symbols: list[str]) -> BackfillReport:
-        """保守回填历史数据，并返回真实成功/失败统计。"""
-        import baostock as bs
+        """并行抓取历史数据，并在主进程中按批校验及原子落库。
 
+        BaoStock 会话只存在于受限数量的 worker 中；SQLite 只由主进程写入。
+        每个完成批次会立即释放原始响应，避免首次全量回填累积全市场历史行。
+        """
         clean_symbols = sorted(self._normalise_symbols(symbols))
         if not clean_symbols:
             return BackfillReport(requested=0, succeeded=0, skipped=0)
+
         target_value = self._latest_trade_date(date.today())
         target_text = target_value.isoformat()
         verified_at_target = self._get_verified_symbols(target_text)
-        previous_timeout = self._with_socket_timeout()
-        succeeded = 0
-        skipped = 0
+
+        # 一次查询全部本地游标，避免为约千只股票反复建立 SQLite 连接。
+        with sqlite3.connect(self.db_path) as conn:
+            last_rows = conn.execute(
+                "SELECT symbol, MAX(date) FROM stock_daily GROUP BY symbol"
+            ).fetchall()
+        last_by_symbol = {
+            str(symbol).zfill(6): str(last_date)
+            for symbol, last_date in last_rows
+            if last_date
+        }
+
+        skipped_symbols: set[str] = set()
         failures: dict[str, str] = {}
+        tasks: list[tuple[str, str, str, str]] = []
+        for symbol in clean_symbols:
+            last_date_text = last_by_symbol.get(symbol)
+            last_date_value: date | None = None
+            if last_date_text:
+                try:
+                    last_date_value = date.fromisoformat(last_date_text)
+                except ValueError:
+                    failures[symbol] = f"invalid local date: {last_date_text!r}"
+                    continue
+                if last_date_value > target_value:
+                    failures[symbol] = f"future local date: {last_date_text}"
+                    continue
+                if last_date_value == target_value and symbol in verified_at_target:
+                    skipped_symbols.add(symbol)
+                    continue
 
-        try:
-            login_error = _login_with_retry(bs, self.max_attempts, self.backoff_seconds)
-            if login_error is not None:
-                raise DataSourceUnavailable(f"baostock 登录失败: {login_error}")
-
-            since_reconnect = 0
-            for index, symbol in enumerate(clean_symbols):
-                last_date_text = self._get_last_date(symbol)
-                last_date_value: date | None = None
-                if last_date_text:
-                    try:
-                        last_date_value = date.fromisoformat(str(last_date_text))
-                    except ValueError:
-                        failures[symbol] = f"invalid local date: {last_date_text!r}"
-                        continue
-                    if last_date_value > target_value:
-                        failures[symbol] = f"future local date: {last_date_text}"
-                        continue
-                    if last_date_value == target_value and symbol in verified_at_target:
-                        skipped += 1
-                        continue
-
-                if since_reconnect >= 200:
-                    _safe_logout(bs)
-                    login_error = _login_with_retry(bs, self.max_attempts, self.backoff_seconds)
-                    if login_error is not None:
-                        raise DataSourceUnavailable(f"baostock 重连失败: {login_error}")
-                    since_reconnect = 0
-                since_reconnect += 1
-
-                start_value = self._start_date_value
-                if last_date_value is not None and last_date_value < target_value:
-                    start_value = max(
-                        last_date_value + timedelta(days=1),
-                        self._start_date_value,
-                    )
-                elif last_date_value == target_value:
-                    start_value = target_value
-                start = start_value.isoformat()
-                task = (symbol, self._to_baostock_code(symbol), start, target_text)
-                rows, error, session_healthy = _query_symbol(
-                    bs,
-                    task,
-                    max_attempts=self.max_attempts,
-                    backoff_seconds=self.backoff_seconds,
+            start_value = self._start_date_value
+            if last_date_value is not None and last_date_value < target_value:
+                start_value = max(
+                    last_date_value + timedelta(days=1),
+                    self._start_date_value,
                 )
-                if not session_healthy:
-                    raise DataSourceUnavailable(error or "baostock 会话失效")
-                if error is not None:
-                    failures[symbol] = error
-                    continue
-                if not rows:
-                    failures[symbol] = (
-                        f"baostock 未返回截至 {target_text} 的预期历史数据"
-                    )
-                    continue
-
-                normalised, _current, invalid = self._normalise_rows(
-                    rows,
-                    expected_symbols={symbol},
-                    target_date=target_text,
+            elif last_date_value == target_value:
+                start_value = target_value
+            tasks.append(
+                (
+                    symbol,
+                    self._to_baostock_code(symbol),
+                    start_value.isoformat(),
+                    target_text,
                 )
-                if invalid or not normalised:
-                    failures[symbol] = invalid.get(symbol, "没有有效历史数据")
-                    continue
-                # 停牌股票可能没有目标交易日 K 线，但有效历史数据仍可用于补齐
-                # 本地股票池。日常同步会另行要求目标日行情并将其排除在策略快照外。
-                self._upsert_rows(normalised)
-                succeeded += 1
+            )
 
-                if (index + 1) % 500 == 0:
-                    logger.info(
-                        f"已处理 {index + 1}/{len(clean_symbols)}，成功 {succeeded} "
-                        f"跳过 {skipped} 失败 {len(failures)}"
-                    )
-        finally:
-            _safe_logout(bs)
-            socket.setdefaulttimeout(previous_timeout)
+        # 历史响应远大于单日响应；进一步限制每批大小来约束峰值内存。
+        backfill_batch_size = min(self.batch_size, 20)
+        batches = [
+            tasks[index : index + backfill_batch_size]
+            for index in range(0, len(tasks), backfill_batch_size)
+        ]
+        logger.info(
+            f"历史回填待抓取 {len(tasks)} 只，使用最多 {self.max_workers} 个进程，"
+            f"拆分为 {len(batches)} 个流式批次（每批最多 {backfill_batch_size} 只）"
+        )
+
+        succeeded_symbols: set[str] = set()
+        processed = len(skipped_symbols) + len(failures)
+        for batch_result in self._iter_fetch_batches(batches):
+            batch_symbols = (
+                set(batch_result.attempted_symbols)
+                | set(batch_result.failed_symbols)
+                | {str(row[0]).zfill(6) for row in batch_result.rows if row}
+            )
+            failures.update(batch_result.failed_symbols)
+
+            normalised, _current, invalid = self._normalise_rows(
+                batch_result.rows,
+                expected_symbols=batch_symbols,
+                target_date=target_text,
+            )
+            failures.update(invalid)
+            valid_symbols = {str(row[0]).zfill(6) for row in normalised}
+
+            for symbol in batch_symbols - valid_symbols - set(failures):
+                failures[symbol] = (
+                    f"baostock 未返回截至 {target_text} 的预期历史数据"
+                )
+
+            if normalised:
+                try:
+                    # 每批一个独立事务；完整性扫描延后到全部批次结束，仅执行一次。
+                    self._upsert_rows(normalised, run_quick_check=False)
+                    succeeded_symbols.update(valid_symbols)
+                    for symbol in valid_symbols:
+                        failures.pop(symbol, None)
+                except (sqlite3.Error, DataIntegrityError) as exc:
+                    error = f"batch database write failed: {type(exc).__name__}: {exc}"
+                    for symbol in valid_symbols:
+                        failures[symbol] = error
+
+            processed += len(batch_symbols)
+            if processed == len(clean_symbols) or processed % 100 < len(batch_symbols):
+                logger.info(
+                    f"已处理 {min(processed, len(clean_symbols))}/{len(clean_symbols)}，"
+                    f"成功 {len(succeeded_symbols)} 跳过 {len(skipped_symbols)} "
+                    f"失败 {len(failures)}"
+                )
+
+        accounted_symbols = succeeded_symbols | skipped_symbols | set(failures)
+        for symbol in set(clean_symbols) - accounted_symbols:
+            failures[symbol] = "batch worker returned no auditable result"
+
+        if not self.database_quick_check():
+            raise DataIntegrityError("历史回填后 SQLite quick_check 失败")
 
         report = BackfillReport(
             requested=len(clean_symbols),
-            succeeded=succeeded,
-            skipped=skipped,
+            succeeded=len(succeeded_symbols),
+            skipped=len(skipped_symbols),
             failed_symbols=failures,
         )
         logger.info(
