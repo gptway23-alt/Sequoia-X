@@ -1,5 +1,6 @@
 """配置管理模块：通过 pydantic-settings 从环境变量或 .env 文件加载系统配置。"""
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -7,7 +8,20 @@ class Settings(BaseSettings):
     db_path: str = "data/sequoia_v2.db"
     start_date: str = "2024-01-01"
     feishu_webhook_url: str | None = None
-    strategy_webhooks: dict[str, str] = {}
+    strategy_webhooks: dict[str, str] = Field(default_factory=dict)
+
+    # BaoStock 的连接是有状态的。默认只开 2 个独立进程，并对用户配置做运行时上限保护。
+    baostock_max_workers: int = 2
+    baostock_batch_size: int = 40
+    baostock_max_attempts: int = 3
+    baostock_backoff_seconds: float = 1.0
+    baostock_socket_timeout_seconds: float = 20.0
+    min_daily_coverage: float = 0.98
+
+    # Gmail 凭据仍由 GitHub Actions secrets / 环境变量提供。
+    gmail_user: str | None = None
+    gmail_app_password: str | None = None
+    email_report_dir: str = "reports"
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -19,7 +33,6 @@ class Settings(BaseSettings):
     @classmethod
     def settings_customise_sources(cls, settings_cls, **kwargs):  # type: ignore[override]
         """扩展配置源，支持从环境变量中扫描 STRATEGY_WEBHOOK_ 前缀的键。"""
-        from pydantic_settings import EnvSettingsSource
         import os
 
         sources = super().settings_customise_sources(settings_cls, **kwargs)
@@ -34,7 +47,6 @@ class Settings(BaseSettings):
 
         # 注入到初始化数据中（通过 init_kwargs source）
         if webhooks:
-            original_init = kwargs.get("init_settings")
             # 直接在 env 层注入，通过 model_post_init 处理
             os.environ.setdefault("_STRATEGY_WEBHOOKS_PARSED", "1")
             # 存储解析结果供 model_validator 使用
@@ -78,13 +90,11 @@ def get_settings() -> Settings:
     """返回全局 Settings 单例。
 
     首次调用时从环境变量或 .env 文件加载配置。
-    若必填字段（feishu_webhook_url）缺失，抛出 pydantic_core.ValidationError。
+    邮件凭据在真正发送前校验，便于回填和无选股运行不依赖 Gmail。
 
     Returns:
         Settings: 全局唯一的配置实例。
 
-    Raises:
-        pydantic_core.ValidationError: 当必填字段缺失或字段类型不匹配时抛出。
     """
     global _settings
     if _settings is None:
