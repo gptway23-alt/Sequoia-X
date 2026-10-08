@@ -1,7 +1,9 @@
-import pandas as pd
 import sqlite3
-from sequoia_x.strategy.base import BaseStrategy
+
+import pandas as pd
+
 from sequoia_x.core.logger import get_logger
+from sequoia_x.strategy.base import BaseStrategy
 
 logger = get_logger(__name__)
 
@@ -14,6 +16,12 @@ class RpsBreakoutStrategy(BaseStrategy):
     rps_threshold: int = 90
 
     def run(self) -> list[str]:
+        verified_symbols = set(self.engine.get_local_symbols())
+        snapshot_date = self.engine.strategy_snapshot_date
+        if not verified_symbols or snapshot_date is None:
+            logger.error("RpsBreakoutStrategy 缺少已核验的策略快照")
+            return []
+
         try:
             with sqlite3.connect(self.engine.db_path) as conn:
                 df = pd.read_sql("SELECT symbol, date, close, high FROM stock_daily", conn)
@@ -24,14 +32,21 @@ class RpsBreakoutStrategy(BaseStrategy):
         if df.empty:
             return []
 
+        df['symbol'] = df['symbol'].astype(str).str.zfill(6)
+        df = df[df['symbol'].isin(verified_symbols)].copy()
         df['date'] = pd.to_datetime(df['date'])
+        snapshot_timestamp = pd.Timestamp(snapshot_date)
+        df = df[df['date'] <= snapshot_timestamp]
+        if df.empty or df['date'].max() != snapshot_timestamp:
+            logger.error("RpsBreakoutStrategy 数据未到达已核验快照日期")
+            return []
         df = df.sort_values(['symbol', 'date'])
 
         # 纵向计算涨幅
         df['close_shift'] = df.groupby('symbol')['close'].shift(self.rps_period)
         df['pct_change'] = (df['close'] - df['close_shift']) / df['close_shift']
 
-        latest_date = df['date'].max()
+        latest_date = snapshot_timestamp
         latest_df = df[df['date'] == latest_date].copy()
         latest_df = latest_df.dropna(subset=['pct_change'])
 
