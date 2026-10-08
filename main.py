@@ -14,12 +14,7 @@ load_dotenv()
 
 from sequoia_x.core.config import get_settings
 from sequoia_x.core.logger import get_logger
-from sequoia_x.data.engine import (
-    SYNC_COMPLETE,
-    SYNC_NON_TRADING_DAY,
-    DataEngine,
-    DataIntegrityError,
-)
+from sequoia_x.data import engine as data_engine
 from sequoia_x.notify.email import EmailNotifier
 from sequoia_x.strategy.base import BaseStrategy
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
@@ -29,6 +24,19 @@ from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
 from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
 from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
 from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
+
+
+REQUIRED_ENGINE_API_VERSION = 2
+if getattr(data_engine, "ENGINE_API_VERSION", 0) != REQUIRED_ENGINE_API_VERSION:
+    raise ImportError(
+        "Sequoia-X 源码版本不一致：main.py 需要 engine API 2。"
+        "请同时覆盖 main.py 与 sequoia_x/data/engine.py，不能只更新其中一个文件。"
+    )
+
+SYNC_COMPLETE = data_engine.SYNC_COMPLETE
+SYNC_NON_TRADING_DAY = data_engine.SYNC_NON_TRADING_DAY
+DataEngine = data_engine.DataEngine
+DataIntegrityError = data_engine.DataIntegrityError
 
 
 SUPPORTED_PREFIXES = (
