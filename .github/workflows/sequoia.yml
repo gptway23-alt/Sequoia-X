@@ -7,20 +7,33 @@ on:
     - cron: "15 19 * * 1-5"
       timezone: "Asia/Shanghai"
 
+concurrency:
+  group: sequoia-x-daily-mail
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
   run-sequoia:
     runs-on: ubuntu-latest
 
-    # 首次历史数据回填可能很慢
-    timeout-minutes: 60
+    # 首次全市场历史回填耗时明显长于日常增量；GitHub job 上限为 360 分钟。
+    timeout-minutes: 300
 
     env:
       GMAIL_USER: ${{ secrets.GMAIL_USER }}
       GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-      GMAIL_TO: ${{ secrets.GMAIL_TO }}
 
       DB_PATH: data/sequoia_v2.db
       START_DATE: "2024-01-01"
+      BAOSTOCK_MAX_WORKERS: "2"
+      BAOSTOCK_BATCH_SIZE: "40"
+      BAOSTOCK_MAX_ATTEMPTS: "3"
+      BAOSTOCK_BACKOFF_SECONDS: "1.0"
+      BAOSTOCK_SOCKET_TIMEOUT_SECONDS: "20"
+      MIN_DAILY_COVERAGE: "0.98"
+      EMAIL_REPORT_DIR: reports
 
     steps:
       - name: Checkout repository
@@ -35,7 +48,14 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install .
+          pip install ".[dev]"
+
+      - name: Verify source bundle compatibility
+        run: |
+          python -c "import main; from sequoia_x.data.engine import ENGINE_API_VERSION; assert ENGINE_API_VERSION == main.REQUIRED_ENGINE_API_VERSION"
+
+      - name: Run offline regression tests
+        run: pytest -q
 
       # 安装完成后再恢复 SQLite 数据库
       - name: Restore database
@@ -43,9 +63,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: data
-          key: sequoia-db-${{ github.run_id }}
+          key: sequoia-db-v2-${{ github.run_id }}
           restore-keys: |
-            sequoia-db-
+            sequoia-db-v2-
 
       - name: Initialize database if needed
         run: |
@@ -59,13 +79,48 @@ jobs:
             ls -lh data/sequoia_v2.db
           fi
 
+      - name: Validate database before daily run
+        run: |
+          python - <<'PY'
+          import os
+          import sqlite3
+
+          path = os.environ["DB_PATH"]
+          with sqlite3.connect(path) as connection:
+              result = connection.execute("PRAGMA quick_check").fetchone()
+              if not result or result[0] != "ok":
+                  raise SystemExit(f"SQLite quick_check failed: {result}")
+          print("SQLite quick_check: ok")
+          PY
+
       - name: Run Sequoia-X
         run: |
           python main.py
 
-      - name: Save database
+      - name: Verify database before cache save
+        run: |
+          python - <<'PY'
+          from sequoia_x.core.config import get_settings
+          from sequoia_x.data.engine import DataEngine
+
+          engine = DataEngine(get_settings())
+          if not engine.database_quick_check():
+              raise SystemExit("SQLite quick_check failed")
+          print("SQLite quick_check: ok")
+          PY
+
+      - name: Upload verified TXT reports
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sequoia-txt-${{ github.run_id }}
+          path: reports/*.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Save database
+        if: success()
         uses: actions/cache/save@v4
         with:
           path: data
-          key: sequoia-db-${{ github.run_id }}
+          key: sequoia-db-v2-${{ github.run_id }}
