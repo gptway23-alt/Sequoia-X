@@ -42,11 +42,44 @@ _CREATE_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
+_CREATE_STAGING_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS stock_daily_staging (
+    target_date TEXT NOT NULL,
+    symbol      TEXT NOT NULL,
+    date        TEXT NOT NULL,
+    open        REAL,
+    high        REAL,
+    low         REAL,
+    close       REAL,
+    volume      REAL,
+    turnover    REAL,
+    PRIMARY KEY (target_date, symbol, date)
+);
+"""
+
+_CREATE_STAGING_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_stock_daily_staging_target
+ON stock_daily_staging (target_date, symbol, date);
+"""
+
 _UPSERT_SQL = """
 INSERT INTO stock_daily
     (symbol, date, open, high, low, close, volume, turnover)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(symbol, date) DO UPDATE SET
+    open = excluded.open,
+    high = excluded.high,
+    low = excluded.low,
+    close = excluded.close,
+    volume = excluded.volume,
+    turnover = excluded.turnover
+"""
+
+_STAGING_UPSERT_SQL = """
+INSERT INTO stock_daily_staging
+    (target_date, symbol, date, open, high, low, close, volume, turnover)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(target_date, symbol, date) DO UPDATE SET
     open = excluded.open,
     high = excluded.high,
     low = excluded.low,
@@ -293,6 +326,8 @@ class DataEngine:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(_CREATE_TABLE_SQL)
             conn.execute(_CREATE_INDEX_SQL)
+            conn.execute(_CREATE_STAGING_TABLE_SQL)
+            conn.execute(_CREATE_STAGING_INDEX_SQL)
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
@@ -435,18 +470,7 @@ class DataEngine:
         return max(trade_dates)
 
     @staticmethod
-    def _get_verified_symbols_from_connection(
-        conn: sqlite3.Connection,
-        target_date: str,
-    ) -> set[str]:
-        rows = conn.execute(
-            """
-            SELECT symbol, open, high, low, close, volume, turnover
-            FROM stock_daily
-            WHERE date = ?
-            """,
-            (target_date,),
-        ).fetchall()
+    def _verified_symbols_from_rows(rows: Iterable[tuple]) -> set[str]:
         verified: set[str] = set()
         for symbol, open_price, high, low, close, volume, turnover in rows:
             try:
@@ -472,9 +496,150 @@ class DataEngine:
             verified.add(str(symbol).zfill(6))
         return verified
 
+    @classmethod
+    def _get_verified_symbols_from_connection(
+        cls,
+        conn: sqlite3.Connection,
+        target_date: str,
+    ) -> set[str]:
+        rows = conn.execute(
+            """
+            SELECT symbol, open, high, low, close, volume, turnover
+            FROM stock_daily
+            WHERE date = ?
+            """,
+            (target_date,),
+        ).fetchall()
+        return cls._verified_symbols_from_rows(rows)
+
+    @classmethod
+    def _get_staged_verified_symbols_from_connection(
+        cls,
+        conn: sqlite3.Connection,
+        target_date: str,
+    ) -> set[str]:
+        rows = conn.execute(
+            """
+            SELECT symbol, open, high, low, close, volume, turnover
+            FROM stock_daily_staging
+            WHERE target_date = ? AND date = ?
+            """,
+            (target_date, target_date),
+        ).fetchall()
+        return cls._verified_symbols_from_rows(rows)
+
     def _get_verified_symbols(self, target_date: str) -> set[str]:
         with sqlite3.connect(self.db_path) as conn:
             return self._get_verified_symbols_from_connection(conn, target_date)
+
+    def _get_staged_verified_symbols(self, target_date: str) -> set[str]:
+        with sqlite3.connect(self.db_path) as conn:
+            return self._get_staged_verified_symbols_from_connection(conn, target_date)
+
+    def _stage_rows(self, rows: list[tuple], target_date: str) -> int:
+        """持久化一个已通过字段校验的批次，但不向策略可见表发布。"""
+        if not rows:
+            return 0
+        staged_rows = [(target_date, *row) for row in rows]
+        with sqlite3.connect(self.db_path) as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.executemany(_STAGING_UPSERT_SQL, staged_rows)
+                conn.commit()
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+        return len(staged_rows)
+
+    def _prune_staging_before(self, target_date: str) -> int:
+        """进入新交易日后删除无法再用于当日门禁的旧暂存批次。"""
+        with sqlite3.connect(self.db_path) as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute(
+                    "DELETE FROM stock_daily_staging WHERE target_date < ?",
+                    (target_date,),
+                )
+                deleted = max(cursor.rowcount, 0)
+                conn.commit()
+                return deleted
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+
+    def _promote_staged_rows(
+        self,
+        target_date: str,
+        expected_symbols: set[str],
+        minimum_coverage: float,
+    ) -> tuple[set[str], int]:
+        """在同一事务内复核覆盖率、发布暂存行情并清空当日暂存区。"""
+        with sqlite3.connect(self.db_path) as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                published_before = (
+                    self._get_verified_symbols_from_connection(conn, target_date)
+                    & expected_symbols
+                )
+                staged_verified = (
+                    self._get_staged_verified_symbols_from_connection(conn, target_date)
+                    & expected_symbols
+                )
+                candidate_verified = published_before | staged_verified
+                coverage = (
+                    len(candidate_verified) / len(expected_symbols)
+                    if expected_symbols
+                    else 0.0
+                )
+                if coverage < minimum_coverage:
+                    raise DataIntegrityError(
+                        f"暂存区覆盖率异常: {coverage:.2%} < {minimum_coverage:.2%}"
+                    )
+
+                staged = conn.execute(
+                    """
+                    SELECT symbol, date, open, high, low, close, volume, turnover
+                    FROM stock_daily_staging
+                    WHERE target_date = ?
+                    """,
+                    (target_date,),
+                ).fetchall()
+                publish_rows = [
+                    tuple(row) for row in staged if str(row[0]).zfill(6) in expected_symbols
+                ]
+                if publish_rows:
+                    conn.executemany(_UPSERT_SQL, publish_rows)
+
+                verified_after = (
+                    self._get_verified_symbols_from_connection(conn, target_date)
+                    & expected_symbols
+                )
+                final_coverage = (
+                    len(verified_after) / len(expected_symbols)
+                    if expected_symbols
+                    else 0.0
+                )
+                if final_coverage < minimum_coverage:
+                    raise DataIntegrityError(
+                        f"发布事务内覆盖率异常: {final_coverage:.2%} < "
+                        f"{minimum_coverage:.2%}"
+                    )
+
+                conn.execute(
+                    "DELETE FROM stock_daily_staging WHERE target_date = ?",
+                    (target_date,),
+                )
+                integrity = conn.execute("PRAGMA quick_check").fetchone()
+                if not integrity or integrity[0] != "ok":
+                    raise DataIntegrityError(f"SQLite quick_check failed: {integrity}")
+                conn.commit()
+                return verified_after, len(publish_rows)
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
 
     def _normalise_rows(
         self,
@@ -665,7 +830,12 @@ class DataEngine:
         expected_symbols: Iterable[str] | None = None,
         target_date: date | None = None,
     ) -> SyncReport:
-        """同步并发布一个经过交易日、数据质量和覆盖率验证的日快照。"""
+        """同步并发布一个经过交易日、数据质量和覆盖率验证的日快照。
+
+        每个成功批次先写入 ``stock_daily_staging``。失败或进程中断后可从
+        暂存进度继续，但策略查询始终只读取 ``stock_daily``。只有合并覆盖率
+        达到门槛时，暂存数据才会在一个 SQLite 事务内整体发布。
+        """
         target_value = target_date or date.today()
         if target_value > date.today():
             raise DataIntegrityError(f"目标日期不能晚于今天: {target_value.isoformat()}")
@@ -678,7 +848,21 @@ class DataEngine:
             last_rows = conn.execute(
                 "SELECT symbol, MAX(date) FROM stock_daily GROUP BY symbol"
             ).fetchall()
+            staged_last_rows = conn.execute(
+                """
+                SELECT symbol, MAX(date)
+                FROM stock_daily_staging
+                WHERE target_date = ?
+                GROUP BY symbol
+                """,
+                (target_text,),
+            ).fetchall()
         last_by_symbol = {str(symbol).zfill(6): last_date for symbol, last_date in last_rows}
+        for symbol, last_date in staged_last_rows:
+            clean_symbol = str(symbol).zfill(6)
+            published_last = last_by_symbol.get(clean_symbol)
+            if published_last is None or str(last_date) > str(published_last):
+                last_by_symbol[clean_symbol] = last_date
 
         if expected_symbols is None:
             expected = set(last_by_symbol)
@@ -705,19 +889,38 @@ class DataEngine:
                 stale_symbols=frozenset(expected - verified_before),
             )
 
-        verified_before = self._get_verified_symbols(target_text) & expected
-        if verified_before == expected:
+        pruned_rows = self._prune_staging_before(target_text)
+        if pruned_rows:
+            logger.info(f"已清理 {pruned_rows} 条旧交易日暂存行情")
+
+        published_before = self._get_verified_symbols(target_text) & expected
+        staged_before = self._get_staged_verified_symbols(target_text) & expected
+        candidate_before = published_before | staged_before
+        initial_coverage = len(candidate_before) / len(expected)
+        if initial_coverage >= self.min_daily_coverage:
+            verified_after, promoted_rows = self._promote_staged_rows(
+                target_text,
+                expected,
+                self.min_daily_coverage,
+            )
+            logger.info(
+                f"{target_text} 已恢复到可发布进度："
+                f"{len(verified_after)}/{len(expected)} 只，"
+                f"覆盖率 {len(verified_after) / len(expected):.2%}"
+            )
             return SyncReport(
                 status=SYNC_COMPLETE,
                 target_date=target_text,
                 is_trade_day=True,
                 expected_symbols=len(expected),
-                verified_symbols=frozenset(verified_before),
+                verified_symbols=frozenset(verified_after),
+                stale_symbols=frozenset(expected - verified_after),
+                rows_written=promoted_rows,
             )
 
         tasks: list[tuple[str, str, str, str]] = []
         preflight_failures: dict[str, str] = {}
-        for symbol in sorted(expected - verified_before):
+        for symbol in sorted(expected - candidate_before):
             last_date_text = last_by_symbol.get(symbol)
             last_date_value: date | None = None
             if last_date_text:
@@ -749,56 +952,71 @@ class DataEngine:
                 f"需要更新 {len(tasks)} 只股票，使用最多 {self.max_workers} 个进程，"
                 f"拆分为 {len(batches)} 个隔离批次"
             )
-            batch_results = self._run_fetch_batches(batches)
+            batch_results: Iterable[BatchFetchResult] = self._iter_fetch_batches(batches)
         else:
+            batches = []
             batch_results = []
 
-        raw_rows: list[list[str]] = []
         failed_symbols = dict(preflight_failures)
-        stale_symbols: set[str] = set()
-        for batch in batch_results:
-            raw_rows.extend(batch.rows)
+        staged_this_run = 0
+        for batch_number, batch in enumerate(batch_results, start=1):
             failed_symbols.update(batch.failed_symbols)
-            stale_symbols.update(batch.stale_symbols)
+            normalised, _fetched_current, invalid = self._normalise_rows(
+                batch.rows,
+                expected_symbols=expected,
+                target_date=target_text,
+            )
+            failed_symbols.update(invalid)
+            if normalised:
+                try:
+                    staged_this_run += self._stage_rows(normalised, target_text)
+                except Exception as exc:
+                    error = f"staging database write failed: {type(exc).__name__}: {exc}"
+                    affected = {str(row[0]).zfill(6) for row in normalised}
+                    failed_symbols.update({symbol: error for symbol in affected})
 
-        normalised, fetched_current, invalid = self._normalise_rows(
-            raw_rows,
-            expected_symbols=expected,
-            target_date=target_text,
-        )
-        failed_symbols.update(invalid)
-        candidate_verified = verified_before | fetched_current
+            if batch_number % 10 == 0 or batch_number == len(batches):
+                logger.info(
+                    f"日行情暂存进度：{batch_number}/{len(batches)} 批，"
+                    f"本轮已校验暂存 {staged_this_run} 条"
+                )
+
+        staged_after = self._get_staged_verified_symbols(target_text) & expected
+        candidate_verified = published_before | staged_after
         coverage = len(candidate_verified) / len(expected)
-        stale_symbols.update(expected - candidate_verified)
+        stale_symbols = expected - candidate_verified
+        failed_symbols = {
+            symbol: error
+            for symbol, error in failed_symbols.items()
+            if symbol not in candidate_verified
+        }
 
         if coverage < self.min_daily_coverage:
+            if not self.database_quick_check():
+                raise DataIntegrityError("暂存行情后 SQLite quick_check 失败")
             logger.error(
                 f"{target_text} 行情覆盖率 {coverage:.2%} 低于门槛 "
-                f"{self.min_daily_coverage:.2%}；本轮数据不发布"
+                f"{self.min_daily_coverage:.2%}；已安全暂存，策略不可见"
             )
             return SyncReport(
                 status=SYNC_INCOMPLETE,
                 target_date=target_text,
                 is_trade_day=True,
                 expected_symbols=len(expected),
-                verified_symbols=frozenset(verified_before),
+                verified_symbols=frozenset(candidate_verified),
                 failed_symbols=failed_symbols,
                 stale_symbols=frozenset(stale_symbols),
             )
 
-        if normalised:
-            verified_after = self._upsert_rows(
-                normalised,
-                target_date=target_text,
-                expected_symbols=expected,
-                minimum_coverage=self.min_daily_coverage,
-            )
-        else:
-            verified_after = verified_before
+        verified_after, promoted_rows = self._promote_staged_rows(
+            target_text,
+            expected,
+            self.min_daily_coverage,
+        )
         final_coverage = len(verified_after) / len(expected)
 
         logger.info(
-            f"sync_today_bulk: 写入 {len(normalised)} 条，"
+            f"sync_today_bulk: 原子发布 {promoted_rows} 条，"
             f"核验 {len(verified_after)}/{len(expected)} 只，覆盖率 {final_coverage:.2%}"
         )
         return SyncReport(
@@ -809,7 +1027,7 @@ class DataEngine:
             verified_symbols=frozenset(verified_after),
             failed_symbols=failed_symbols,
             stale_symbols=frozenset(expected - verified_after),
-            rows_written=len(normalised),
+            rows_written=promoted_rows,
         )
 
     def backfill(self, symbols: list[str]) -> BackfillReport:
