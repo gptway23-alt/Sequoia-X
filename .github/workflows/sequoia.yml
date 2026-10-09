@@ -2,6 +2,12 @@ name: Sequoia-X Daily
 
 on:
   workflow_dispatch:
+    inputs:
+      target_date:
+        description: "可选目标交易日（YYYY-MM-DD）；留空时使用程序默认日期"
+        required: false
+        type: string
+        default: ""
 
   schedule:
     - cron: "15 19 * * 1-5"
@@ -22,6 +28,7 @@ jobs:
     timeout-minutes: 300
 
     env:
+      TZ: Asia/Shanghai
       GMAIL_USER: ${{ secrets.GMAIL_USER }}
       GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
 
@@ -63,11 +70,16 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: data
-          key: sequoia-db-v2-${{ github.run_id }}
+          # Cache entries are immutable. Include run_attempt so a re-run can
+          # save newer, verified progress under the same workflow run_id.
+          key: sequoia-db-v3-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            sequoia-db-v3-
             sequoia-db-v2-
 
       - name: Initialize database if needed
+        id: initialize_db
+        continue-on-error: true
         run: |
           mkdir -p data
 
@@ -80,13 +92,18 @@ jobs:
           fi
 
       - name: Validate database before daily run
+        id: preflight_db
+        if: steps.initialize_db.outcome == 'success'
+        continue-on-error: true
         run: |
           python - <<'PY'
           import os
           import sqlite3
 
           path = os.environ["DB_PATH"]
-          with sqlite3.connect(path) as connection:
+          if not os.path.isfile(path) or os.path.getsize(path) == 0:
+              raise SystemExit(f"Database is missing or empty: {path}")
+          with sqlite3.connect(f"file:{path}?mode=rw", uri=True) as connection:
               result = connection.execute("PRAGMA quick_check").fetchone()
               if not result or result[0] != "ok":
                   raise SystemExit(f"SQLite quick_check failed: {result}")
@@ -94,18 +111,43 @@ jobs:
           PY
 
       - name: Run Sequoia-X
+        id: run_sequoia
+        if: >-
+          steps.initialize_db.outcome == 'success' &&
+          steps.preflight_db.outcome == 'success'
+        continue-on-error: true
+        env:
+          TARGET_DATE: ${{ inputs.target_date }}
         run: |
-          python main.py
+          if [ -n "$TARGET_DATE" ]; then
+            python main.py --target-date "$TARGET_DATE"
+          else
+            python main.py
+          fi
 
       - name: Verify database before cache save
+        id: verify_db
+        if: always()
+        continue-on-error: true
         run: |
           python - <<'PY'
-          from sequoia_x.core.config import get_settings
-          from sequoia_x.data.engine import DataEngine
+          import os
+          import sqlite3
 
-          engine = DataEngine(get_settings())
-          if not engine.database_quick_check():
-              raise SystemExit("SQLite quick_check failed")
+          path = os.environ["DB_PATH"]
+          if not os.path.isfile(path) or os.path.getsize(path) == 0:
+              raise SystemExit(f"Database is missing or empty: {path}")
+
+          # Use read/write mode without allowing sqlite3 to create a missing
+          # file. A successful checkpoint makes the cached DB self-contained
+          # even if the application selected WAL journal mode.
+          with sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=30) as connection:
+              checkpoint = connection.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
+              if checkpoint and checkpoint[0] != 0:
+                  raise SystemExit(f"SQLite WAL checkpoint is busy: {checkpoint}")
+              result = connection.execute("PRAGMA quick_check").fetchone()
+              if not result or result[0] != "ok":
+                  raise SystemExit(f"SQLite quick_check failed: {result}")
           print("SQLite quick_check: ok")
           PY
 
@@ -113,14 +155,46 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sequoia-txt-${{ github.run_id }}
+          name: sequoia-txt-${{ github.run_id }}-${{ github.run_attempt }}
           path: reports/*.txt
           if-no-files-found: ignore
           retention-days: 14
 
       - name: Save database
-        if: success()
+        id: save_db
+        if: always() && steps.verify_db.outcome == 'success'
         uses: actions/cache/save@v4
         with:
           path: data
-          key: sequoia-db-v2-${{ github.run_id }}
+          key: sequoia-db-v3-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # The data cache must be saved before the job is marked failed. This
+      # preserves resumable, integrity-checked progress while keeping the red
+      # status for incomplete market data or any earlier execution failure.
+      - name: Preserve final job status
+        if: always()
+        env:
+          INITIALIZE_OUTCOME: ${{ steps.initialize_db.outcome }}
+          PREFLIGHT_OUTCOME: ${{ steps.preflight_db.outcome }}
+          RUN_OUTCOME: ${{ steps.run_sequoia.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify_db.outcome }}
+        run: |
+          failed=0
+
+          if [ "$INITIALIZE_OUTCOME" != "success" ]; then
+            echo "::error::Database initialization/backfill failed. Verified progress was cached when possible."
+            failed=1
+          elif [ "$PREFLIGHT_OUTCOME" != "success" ]; then
+            echo "::error::Database validation failed before the daily run."
+            failed=1
+          elif [ "$RUN_OUTCOME" != "success" ]; then
+            echo "::error::Sequoia-X did not complete. Verified database progress was cached for the next run."
+            failed=1
+          fi
+
+          if [ "$VERIFY_OUTCOME" != "success" ]; then
+            echo "::error::Database failed the final integrity check and was not cached."
+            failed=1
+          fi
+
+          exit "$failed"
