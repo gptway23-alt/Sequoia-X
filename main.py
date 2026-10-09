@@ -1,12 +1,15 @@
 """Sequoia-X V2 主程序入口。
 
-两种运行模式：
+三种运行模式：
   python main.py               # 日常模式：增量补数据 + 跑策略 + 邮件推送
+  python main.py --target-date 2026-10-09  # 重跑指定历史交易日
   python main.py --backfill    # 回填模式：baostock 拉全市场历史K线
 """
 
 import argparse
 import sys
+from datetime import date, datetime, time
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -37,6 +40,42 @@ SYNC_COMPLETE = data_engine.SYNC_COMPLETE
 SYNC_NON_TRADING_DAY = data_engine.SYNC_NON_TRADING_DAY
 DataEngine = data_engine.DataEngine
 DataIntegrityError = data_engine.DataIntegrityError
+
+
+SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
+DEFAULT_DAILY_SYNC_NOT_BEFORE = "15:30"
+
+
+def _shanghai_now() -> datetime:
+    """返回中国市场本地时间，避免 GitHub Ubuntu 的 UTC 日期漂移。"""
+    return datetime.now(SHANGHAI_TIMEZONE)
+
+
+def _parse_daily_sync_not_before(value: object) -> time:
+    """解析日行情最早同步时间；配置错误时直接失败，禁止猜测日期。"""
+    text = str(value).strip()
+    try:
+        parsed = datetime.strptime(text, "%H:%M").time()
+    except ValueError as exc:
+        raise DataIntegrityError(
+            f"DAILY_SYNC_NOT_BEFORE 必须是 HH:MM（Asia/Shanghai），当前值: {text!r}"
+        ) from exc
+    return parsed
+
+
+def _parse_target_date(value: str) -> date:
+    """严格解析命令行目标日期，避免含糊格式被静默接受。"""
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"目标日期必须是 YYYY-MM-DD，当前值: {value!r}"
+        ) from exc
+    if parsed.isoformat() != value:
+        raise argparse.ArgumentTypeError(
+            f"目标日期必须是 YYYY-MM-DD，当前值: {value!r}"
+        )
+    return parsed
 
 
 SUPPORTED_PREFIXES = (
@@ -74,10 +113,16 @@ def _require_complete_local_universe(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sequoia-X V2 选股系统")
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--backfill",
         action="store_true",
         help="回填模式：通过 baostock 拉取全市场历史 K 线",
+    )
+    mode.add_argument(
+        "--target-date",
+        type=_parse_target_date,
+        help="日常模式的目标交易日，格式 YYYY-MM-DD；用于重跑历史日期",
     )
     args = parser.parse_args()
 
@@ -88,6 +133,36 @@ def main() -> None:
         # 2. 初始化日志
         logger = get_logger(__name__)
         logger.info("Sequoia-X V2 启动")
+
+        # 日常任务必须使用中国市场日期。GitHub Ubuntu 通常以 UTC 记录日志，
+        # 若直接使用 date.today()，上海凌晨运行会错误地把前一日当成当日。
+        shanghai_now: datetime | None = None
+        target_date: date | None = None
+        if not args.backfill:
+            shanghai_now = _shanghai_now()
+            target_date = args.target_date or shanghai_now.date()
+            if target_date > shanghai_now.date():
+                raise DataIntegrityError(
+                    f"目标日期 {target_date.isoformat()} 晚于上海今天 "
+                    f"{shanghai_now.date().isoformat()}"
+                )
+            sync_not_before = _parse_daily_sync_not_before(
+                getattr(settings, "daily_sync_not_before", DEFAULT_DAILY_SYNC_NOT_BEFORE)
+            )
+            target_is_today = target_date == shanghai_now.date()
+            before_cutoff = (shanghai_now.hour, shanghai_now.minute) < (
+                sync_not_before.hour,
+                sync_not_before.minute,
+            )
+            if target_is_today and before_cutoff:
+                logger.info(
+                    "当前上海时间 "
+                    f"{shanghai_now:%Y-%m-%d %H:%M}，早于日行情安全同步时间 "
+                    f"{sync_not_before:%H:%M}；本轮快速停止，不抓取、不选股、不发邮件"
+                )
+                return
+            run_kind = "历史重跑" if not target_is_today else "当日运行"
+            logger.info(f"日常行情目标日期：{target_date.isoformat()}（{run_kind}）")
 
         # 3. 初始化数据引擎
         engine = DataEngine(settings)
@@ -164,7 +239,12 @@ def main() -> None:
 
         # 5. 增量同步
         logger.info("开始拉取最新快照...")
-        sync_report = engine.sync_today_bulk(expected_symbols=all_symbols)
+        if target_date is None:  # 仅用于收窄类型；日常分支中必有目标日期。
+            raise DataIntegrityError("无法确定 Asia/Shanghai 行情日期")
+        sync_report = engine.sync_today_bulk(
+            expected_symbols=all_symbols,
+            target_date=target_date,
+        )
         if sync_report.status == SYNC_NON_TRADING_DAY:
             logger.info(
                 f"{sync_report.target_date} 不是交易日；不运行策略，不生成或发送 TXT"
