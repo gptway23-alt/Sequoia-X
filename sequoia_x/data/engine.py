@@ -407,8 +407,9 @@ class DataEngine:
     ) -> int:
         """原子保存一次完整策略运行，只接受同步门禁核验过的股票。
 
-        同一市场日期重跑时会完整替换该日记录。该表仅保存选股审计数据，
-        不包含订单、资金、持仓或 NAV，也不会读取未发布的 staging 行情。
+        同一市场日期重跑且核验结果完全相同时保留原记录时间；结果变化时才
+        原子替换该日记录。该表仅保存选股审计数据，不包含订单、资金、持仓
+        或 NAV，也不会读取未发布的 staging 行情。
         """
         if not sync_report.complete or not sync_report.is_trade_day:
             raise DataIntegrityError("只能记录已完成交易日的选股结果")
@@ -487,6 +488,42 @@ class DataEngine:
                 raise DataIntegrityError(
                     f"{market_date} 已核验股票缺少同日有效已发布行情: {preview}"
                 )
+            existing_run = conn.execute(
+                """
+                SELECT expected_symbols, verified_symbols, coverage,
+                       verified_symbols_json, strategies_json, result_rows
+                FROM selection_runs
+                WHERE market_date = ?
+                """,
+                (market_date,),
+            ).fetchone()
+            existing_results = conn.execute(
+                """
+                SELECT market_date, strategy, symbol
+                FROM selection_results
+                WHERE market_date = ?
+                ORDER BY strategy, symbol
+                """,
+                (market_date,),
+            ).fetchall()
+            ordered_results = sorted(result_rows, key=lambda row: (row[1], row[2]))
+            if (
+                existing_run is not None
+                and int(existing_run[0]) == sync_report.expected_symbols
+                and int(existing_run[1]) == len(verified)
+                and math.isclose(
+                    float(existing_run[2]),
+                    sync_report.coverage,
+                    rel_tol=0,
+                    abs_tol=1e-12,
+                )
+                and str(existing_run[3]) == verified_symbols_json
+                and str(existing_run[4]) == strategies_json
+                and int(existing_run[5]) == len(result_rows)
+                and existing_results == ordered_results
+            ):
+                conn.rollback()
+                return len(result_rows)
             conn.execute(
                 "DELETE FROM selection_results WHERE market_date = ?",
                 (market_date,),
