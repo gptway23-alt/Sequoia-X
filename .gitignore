@@ -36,6 +36,7 @@ build/
 .pip-tmp/
 .smoke-manual/
 .manual-pytest/
+.manual-*/
 .gpt-export-smoke-*/
 
 # 日志
