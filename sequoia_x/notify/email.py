@@ -80,12 +80,13 @@ class EmailNotifier:
             explicit=user,
             configured=getattr(settings, "gmail_user", None),
             environment_key="GMAIL_USER",
-        )
+        ).strip()
         self.password = self._credential(
             explicit=password,
             configured=getattr(settings, "gmail_app_password", None),
             environment_key="GMAIL_APP_PASSWORD",
         )
+        self.recipients = self._recipient_list((*RECIPIENTS, self.user))
         configured_report_dir = getattr(settings, "email_report_dir", None)
         selected_report_dir = report_dir if report_dir is not None else configured_report_dir
         self.report_dir = Path(selected_report_dir or "reports")
@@ -108,6 +109,26 @@ class EmailNotifier:
         if not isinstance(value, str) or not value.strip():
             raise EmailConfigurationError(f"missing required email credential: {environment_key}")
         return value
+
+    @staticmethod
+    def _recipient_list(recipients: Iterable[str]) -> tuple[str, ...]:
+        """Return non-empty recipients in stable order with case-insensitive de-duplication."""
+
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for raw_recipient in recipients:
+            if not isinstance(raw_recipient, str) or not raw_recipient.strip():
+                raise EmailConfigurationError("email recipients must be non-empty strings")
+            recipient = raw_recipient.strip()
+            identity = recipient.casefold()
+            if identity in seen:
+                continue
+            seen.add(identity)
+            ordered.append(recipient)
+
+        if not ordered:
+            raise EmailConfigurationError("at least one email recipient is required")
+        return tuple(ordered)
 
     def send_report(
         self,
@@ -141,7 +162,11 @@ class EmailNotifier:
                 report_path=report_path,
             )
 
-        message_id = self._message_id(normalized_date, report_text)
+        message_id = self._message_id(
+            normalized_date,
+            report_text,
+            self.recipients,
+        )
         if self._is_in_sent(message_id):
             return EmailSendResult(
                 status=EmailSendStatus.ALREADY_SENT,
@@ -247,8 +272,15 @@ class EmailNotifier:
         return report_path.resolve()
 
     @staticmethod
-    def _message_id(market_date: str, report_text: str) -> str:
-        material = f"{market_date}\n{report_text}".encode("utf-8")
+    def _message_id(
+        market_date: str,
+        report_text: str,
+        recipients: Iterable[str],
+    ) -> str:
+        recipient_identity = "\n".join(
+            sorted(recipient.strip().casefold() for recipient in recipients)
+        )
+        material = f"{market_date}\n{recipient_identity}\n{report_text}".encode("utf-8")
         digest = hashlib.sha256(material).hexdigest()
         return f"<sequoia-x-{market_date.replace('-', '')}-{digest[:32]}@sequoia-x.local>"
 
@@ -263,7 +295,7 @@ class EmailNotifier:
         message = EmailMessage()
         message["Subject"] = f"Sequoia-X | {market_date} | {len(report_symbols)}只"
         message["From"] = self.user
-        message["To"] = ", ".join(RECIPIENTS)
+        message["To"] = ", ".join(self.recipients)
         message["Message-ID"] = message_id
         message.set_content(
             "Sequoia-X 已核验选股结果见附件。\n"
