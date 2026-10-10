@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import math
 import socket
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -20,7 +21,7 @@ logger = get_logger(__name__)
 
 
 # main.py、测试与工作流依赖这一版结构化同步接口。修改接口时必须同步升级该值。
-ENGINE_API_VERSION = 2
+ENGINE_API_VERSION = 3
 
 
 _CREATE_TABLE_SQL = """
@@ -60,6 +61,36 @@ CREATE TABLE IF NOT EXISTS stock_daily_staging (
 _CREATE_STAGING_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_stock_daily_staging_target
 ON stock_daily_staging (target_date, symbol, date);
+"""
+
+_CREATE_SELECTION_RUNS_SQL = """
+CREATE TABLE IF NOT EXISTS selection_runs (
+    market_date      TEXT    PRIMARY KEY,
+    recorded_at      TEXT    NOT NULL,
+    expected_symbols INTEGER NOT NULL CHECK (expected_symbols >= 0),
+    verified_symbols INTEGER NOT NULL CHECK (verified_symbols >= 0),
+    coverage         REAL    NOT NULL CHECK (coverage >= 0.0 AND coverage <= 1.0),
+    verified_symbols_json TEXT NOT NULL,
+    strategies_json  TEXT    NOT NULL,
+    result_rows      INTEGER NOT NULL CHECK (result_rows >= 0)
+);
+"""
+
+_CREATE_SELECTION_RESULTS_SQL = """
+CREATE TABLE IF NOT EXISTS selection_results (
+    market_date TEXT NOT NULL,
+    strategy    TEXT NOT NULL,
+    symbol      TEXT NOT NULL,
+    PRIMARY KEY (market_date, strategy, symbol),
+    FOREIGN KEY (market_date)
+        REFERENCES selection_runs (market_date)
+        ON DELETE CASCADE
+);
+"""
+
+_CREATE_SELECTION_RESULTS_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_selection_results_symbol_date
+ON selection_results (symbol, market_date);
 """
 
 _UPSERT_SQL = """
@@ -316,7 +347,12 @@ class DataEngine:
             5.0,
             min(float(settings.baostock_socket_timeout_seconds), 120.0),
         )
-        self.min_daily_coverage = max(0.0, min(float(settings.min_daily_coverage), 1.0))
+        self.min_daily_coverage = float(settings.min_daily_coverage)
+        if (
+            not math.isfinite(self.min_daily_coverage)
+            or not 0.0 < self.min_daily_coverage <= 1.0
+        ):
+            raise DataIntegrityError("MIN_DAILY_COVERAGE 必须是 (0, 1] 范围内的有限数值")
         self._snapshot_date: str | None = None
         self._snapshot_symbols: tuple[str, ...] | None = None
         self._init_db()
@@ -328,6 +364,9 @@ class DataEngine:
             conn.execute(_CREATE_INDEX_SQL)
             conn.execute(_CREATE_STAGING_TABLE_SQL)
             conn.execute(_CREATE_STAGING_INDEX_SQL)
+            conn.execute(_CREATE_SELECTION_RUNS_SQL)
+            conn.execute(_CREATE_SELECTION_RESULTS_SQL)
+            conn.execute(_CREATE_SELECTION_RESULTS_INDEX_SQL)
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
@@ -360,6 +399,138 @@ class DataEngine:
         self._snapshot_date = trade_date
         self._snapshot_symbols = tuple(clean)
 
+    def record_verified_selections(
+        self,
+        sync_report: SyncReport,
+        strategy_results: dict[str, list[str]],
+        executed_strategies: Iterable[str],
+    ) -> int:
+        """原子保存一次完整策略运行，只接受同步门禁核验过的股票。
+
+        同一市场日期重跑时会完整替换该日记录。该表仅保存选股审计数据，
+        不包含订单、资金、持仓或 NAV，也不会读取未发布的 staging 行情。
+        """
+        if not sync_report.complete or not sync_report.is_trade_day:
+            raise DataIntegrityError("只能记录已完成交易日的选股结果")
+
+        market_date = date.fromisoformat(sync_report.target_date).isoformat()
+        if sync_report.expected_symbols <= 0:
+            raise DataIntegrityError("选股记录的预期股票数必须大于零")
+
+        verified = self._normalise_symbols(sync_report.verified_symbols)
+        if not verified:
+            raise DataIntegrityError("选股记录缺少已核验股票")
+        if len(verified) != len(sync_report.verified_symbols):
+            raise DataIntegrityError("已核验股票存在重复或无效值")
+        if len(verified) > sync_report.expected_symbols:
+            raise DataIntegrityError("已核验股票数不能超过预期股票数")
+        if not 0.0 <= sync_report.coverage <= 1.0:
+            raise DataIntegrityError("选股记录覆盖率必须在 0 到 1 之间")
+        if sync_report.coverage < self.min_daily_coverage:
+            raise DataIntegrityError(
+                f"选股记录覆盖率 {sync_report.coverage:.2%} 低于门槛 "
+                f"{self.min_daily_coverage:.2%}"
+            )
+
+        requested_strategies = tuple(
+            str(value).strip()
+            for value in executed_strategies
+        )
+        strategies = tuple(dict.fromkeys(requested_strategies))
+        if not strategies or any(not value for value in strategies):
+            raise DataIntegrityError("选股记录缺少有效策略名称")
+        if len(strategies) != len(requested_strategies):
+            raise DataIntegrityError("选股记录包含重复策略名称")
+
+        unknown_strategies = set(strategy_results) - set(strategies)
+        if unknown_strategies:
+            raise DataIntegrityError(
+                "选股结果包含未执行策略: " + ", ".join(sorted(unknown_strategies))
+            )
+
+        result_rows: list[tuple[str, str, str]] = []
+        for strategy in strategies:
+            symbols = self._normalise_symbols(strategy_results.get(strategy, []))
+            unverified = symbols - verified
+            if unverified:
+                preview = ", ".join(sorted(unverified)[:10])
+                raise DataIntegrityError(
+                    f"{strategy} 包含未通过 {market_date} 行情核验的股票: {preview}"
+                )
+            result_rows.extend(
+                (market_date, strategy, symbol)
+                for symbol in sorted(symbols)
+            )
+
+        recorded_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        strategies_json = json.dumps(
+            strategies,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        verified_symbols_json = json.dumps(
+            sorted(verified),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("BEGIN IMMEDIATE")
+            published_for_date = self._get_verified_symbols_from_connection(
+                conn,
+                market_date,
+            )
+            missing_published = sorted(verified - published_for_date)
+            if missing_published:
+                preview = ", ".join(missing_published[:10])
+                raise DataIntegrityError(
+                    f"{market_date} 已核验股票缺少同日有效已发布行情: {preview}"
+                )
+            conn.execute(
+                "DELETE FROM selection_results WHERE market_date = ?",
+                (market_date,),
+            )
+            conn.execute(
+                "DELETE FROM selection_runs WHERE market_date = ?",
+                (market_date,),
+            )
+            conn.execute(
+                """
+                INSERT INTO selection_runs (
+                    market_date,
+                    recorded_at,
+                    expected_symbols,
+                    verified_symbols,
+                    coverage,
+                    verified_symbols_json,
+                    strategies_json,
+                    result_rows
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    market_date,
+                    recorded_at,
+                    sync_report.expected_symbols,
+                    len(verified),
+                    sync_report.coverage,
+                    verified_symbols_json,
+                    strategies_json,
+                    len(result_rows),
+                ),
+            )
+            if result_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO selection_results (market_date, strategy, symbol)
+                    VALUES (?, ?, ?)
+                    """,
+                    result_rows,
+                )
+            conn.commit()
+
+        return len(result_rows)
+
     @property
     def strategy_snapshot_date(self) -> str | None:
         return self._snapshot_date
@@ -374,7 +545,7 @@ class DataEngine:
         clean: set[str] = set()
         for raw_symbol in symbols:
             symbol = str(raw_symbol).strip().zfill(6)
-            if len(symbol) != 6 or not symbol.isdigit():
+            if len(symbol) != 6 or not symbol.isascii() or not symbol.isdigit():
                 raise DataIntegrityError(f"无效股票代码: {raw_symbol!r}")
             clean.add(symbol)
         return clean
