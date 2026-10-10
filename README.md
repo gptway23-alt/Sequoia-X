@@ -18,11 +18,12 @@ Sequoia-X V2 是面向 A 股市场的量化选股系统，基于现代 Python �
 
 ---
 
-## 两种运行模式
+## 三种运行方式
 
 ```bash
-python main.py               # 日常模式：受控增量同步 + 跑策略 + 已核验 TXT 邮件
-python main.py --backfill     # 回填模式：全市场历史K线一次性灌入（约12分钟）
+python main.py                           # 日常模式：受控增量同步 + 跑策略 + 已核验 TXT 邮件
+python main.py --target-date 2026-10-09 # 指定历史交易日重跑
+python main.py --backfill                # 回填模式：全市场历史 K 线一次性灌入
 ```
 
 ---
@@ -37,6 +38,7 @@ python main.py --backfill     # 回填模式：全市场历史K线一次性灌�
 | **LimitUpShakeout** | 涨停洗盘回踩确认 |
 | **UptrendLimitDown** | 上升趋势中的跌停反包 |
 | **RpsBreakout** | 欧奈尔 RPS 相对强度突破 |
+| **PrivatePlacement** | 定增事件筛选；历史重跑按目标日期截断事件，防止前视 |
 
 ---
 
@@ -50,7 +52,7 @@ python main.py --backfill     # 回填模式：全市场历史K线一次性灌�
 
 ```bash
 # 推荐使用 uv（快速包管理器）
-uv sync
+uv sync --locked
 
 # 或者 pip
 pip install .
@@ -69,7 +71,7 @@ cp .env.example .env
 python main.py --backfill
 ```
 
-约 12 分钟完成 ~5200 只 A 股历史后复权日 K 数据回填。
+全市场首次回填可能持续较长时间；工作流会缓存已经通过完整性检查的进度，后续运行继续补齐。
 
 ### 4. 日常运行
 
@@ -89,7 +91,7 @@ python main.py
 
 ```
 Sequoia-X/
-├── main.py                      # 入口：argparse 分发日常/回填模式
+├── main.py                      # 入口：日常、指定日期重跑和历史回填
 ├── pyproject.toml               # 依赖声明 + ruff/pytest 配置
 ├── .env.example                 # 环境变量模板
 ├── data/                        # SQLite 数据库（运行时生成，不入 git）
@@ -98,7 +100,8 @@ Sequoia-X/
 │   │   ├── config.py            # Pydantic-settings 配置管理
 │   │   └── logger.py            # rich 结构化日志
 │   ├── data/
-│   │   └── engine.py            # 数据引擎（baostock 回填 + 增量同步 + SQLite）
+│   │   ├── engine.py            # 数据引擎（baostock 回填 + 增量同步 + SQLite）
+│   │   └── gpt_export.py        # 已发布行情与已核验选股历史的安全快照
 │   ├── strategy/
 │   │   ├── base.py              # 策略抽象基类
 │   │   ├── turtle_trade.py      # 海龟交易策略
@@ -106,7 +109,8 @@ Sequoia-X/
 │   │   ├── high_tight_flag.py   # 高窄旗形策略
 │   │   ├── limit_up_shakeout.py # 涨停洗盘策略
 │   │   ├── uptrend_limit_down.py # 上升跌停策略
-│   │   └── rps_breakout.py      # RPS 突破策略
+│   │   ├── rps_breakout.py      # RPS 突破策略
+│   │   └── private_placement.py # 定增事件策略
 │   └── notify/
 │       ├── email.py             # TXT 报告、SENT 去重和有限重试
 │       └── feishu.py            # 可选的飞书 Webhook 推送
@@ -121,8 +125,43 @@ Sequoia-X/
 - **复权方式**：后复权（hfq）— 历史价格不变，适合增量存储，避免除权导致数据错乱
 - **存储**：本地 SQLite（`data/sequoia_v2.db`），可直接拷贝到其他机器使用
 - **日常增量**：默认最多 2 个进程、小批次隔离、有限退避重试；覆盖率不达标时不发布
-- **邮件安全**：策略只读取目标交易日已核验股票；发送前查询 SENT，失败最多重试一次
+- **邮件安全**：策略只读取目标交易日已核验股票；同步发送至两个 QQ 邮箱和 `gptway23@gmail.com`；发送前查询 SENT，失败最多重试一次
 - **创业板支持**：300xxx / 301xxx 自动纳入股票池；涉及涨跌停的策略按 20% 常规限制判断
+
+---
+
+## 让 GPT 读取完整数据库
+
+程序会从启用本版本后的每个完整交易日开始，将已核验选股历史写入：
+
+- `selection_runs`：市场日期、覆盖率、已执行策略和结果行数。
+- `selection_results`：市场日期、策略名称和股票代码。
+
+GitHub Actions 只有在该市场日期已通过行情门禁时，才会生成
+`sequoia-gpt-database-<market_date>-<run_id>-<run_attempt>` Artifact（保留 7 天）。压缩包包含：
+
+- `sequoia-x-verified.sqlite3`：全部已发布日线行情和完整选股历史。
+- `manifest.json`：数据日期、行数、覆盖率和数据库 SHA-256。
+- `README.txt`：只读查询说明和示例。
+
+`stock_daily_staging` 不会进入快照；订单、资金、持仓、NAV 和任何未知表也不会复制。
+因此同步失败时不会把暂存数据或上一交易日行情标成当日行情。邮件发送失败不会删除已经
+原子保存的选股历史，工作流仍可生成已核验数据库 Artifact，同时保留邮件失败状态。
+
+使用方法：
+
+1. 打开对应的 GitHub Actions 运行页面。
+2. 在 **Artifacts** 下载 `sequoia-gpt-database-...` 并解压。
+3. 将 `sequoia-x-verified.sqlite3` 和 `manifest.json` 一起上传给 GPT。
+4. 先让 GPT 校验 `manifest.json` 的 SHA-256 和 `latest_market_date`，再以 SQLite 只读模式查询。
+
+可以使用以下提示词：
+
+```text
+读取 manifest.json 和 sequoia-x-verified.sqlite3。先校验数据库 SHA-256，报告
+latest_market_date、覆盖率与选股历史的最新日期；随后仅以只读方式查询。
+若请求日期晚于 latest_market_date，明确说明数据尚不可用，不得用旧行情代替。
+```
 
 ---
 

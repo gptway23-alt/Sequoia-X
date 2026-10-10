@@ -7,8 +7,11 @@
 """
 
 import argparse
+import json
+import os
 import sys
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -29,10 +32,10 @@ from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
 from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
 
 
-REQUIRED_ENGINE_API_VERSION = 2
+REQUIRED_ENGINE_API_VERSION = 3
 if getattr(data_engine, "ENGINE_API_VERSION", 0) != REQUIRED_ENGINE_API_VERSION:
     raise ImportError(
-        "Sequoia-X 源码版本不一致：main.py 需要 engine API 2。"
+        "Sequoia-X 源码版本不一致：main.py 需要 engine API 3。"
         "请同时覆盖 main.py 与 sequoia_x/data/engine.py，不能只更新其中一个文件。"
     )
 
@@ -44,6 +47,8 @@ DataIntegrityError = data_engine.DataIntegrityError
 
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 DEFAULT_DAILY_SYNC_NOT_BEFORE = "15:30"
+DEFAULT_GPT_EXPORT_STATE_PATH = "reports/gpt-export-state.json"
+GPT_EXPORT_STATE_SCHEMA_VERSION = 1
 
 
 def _shanghai_now() -> datetime:
@@ -76,6 +81,64 @@ def _parse_target_date(value: str) -> date:
             f"目标日期必须是 YYYY-MM-DD，当前值: {value!r}"
         )
     return parsed
+
+
+def _gpt_export_state_path(settings: object) -> Path:
+    configured = getattr(
+        settings,
+        "gpt_export_state_path",
+        DEFAULT_GPT_EXPORT_STATE_PATH,
+    )
+    return Path(str(configured))
+
+
+def _clear_gpt_export_state(settings: object) -> None:
+    """清除上一次运行状态，防止失败运行复用旧的完整标志。"""
+    _gpt_export_state_path(settings).unlink(missing_ok=True)
+
+
+def _write_gpt_export_state(
+    settings: object,
+    *,
+    status: str,
+    market_date: str,
+    expected_symbols: int = 0,
+    verified_symbols: int = 0,
+    coverage: float = 0.0,
+    selection_result_rows: int = 0,
+) -> Path:
+    """原子写入本次运行状态，供 GitHub Actions 绑定当前运行的导出。"""
+    if status not in {"complete", "non_trading_day", "before_cutoff"}:
+        raise ValueError(f"不支持的 GPT 导出状态: {status}")
+    canonical_date = date.fromisoformat(market_date).isoformat()
+    payload = {
+        "schema_version": GPT_EXPORT_STATE_SCHEMA_VERSION,
+        "status": status,
+        "market_date": canonical_date,
+        "expected_symbols": int(expected_symbols),
+        "verified_symbols": int(verified_symbols),
+        "coverage": float(coverage),
+        "selection_result_rows": int(selection_result_rows),
+        "source_run_id": os.environ.get("GITHUB_RUN_ID", "local"),
+        "source_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "local"),
+        "written_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    }
+    path = _gpt_export_state_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    temporary_path.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
+    return path.resolve()
 
 
 SUPPORTED_PREFIXES = (
@@ -129,6 +192,7 @@ def main() -> None:
     try:
         # 1. 初始化配置
         settings = get_settings()
+        _clear_gpt_export_state(settings)
 
         # 2. 初始化日志
         logger = get_logger(__name__)
@@ -159,6 +223,11 @@ def main() -> None:
                     "当前上海时间 "
                     f"{shanghai_now:%Y-%m-%d %H:%M}，早于日行情安全同步时间 "
                     f"{sync_not_before:%H:%M}；本轮快速停止，不抓取、不选股、不发邮件"
+                )
+                _write_gpt_export_state(
+                    settings,
+                    status="before_cutoff",
+                    market_date=target_date.isoformat(),
                 )
                 return
             run_kind = "历史重跑" if not target_is_today else "当日运行"
@@ -246,6 +315,14 @@ def main() -> None:
             target_date=target_date,
         )
         if sync_report.status == SYNC_NON_TRADING_DAY:
+            _write_gpt_export_state(
+                settings,
+                status="non_trading_day",
+                market_date=sync_report.target_date,
+                expected_symbols=sync_report.expected_symbols,
+                verified_symbols=len(sync_report.verified_symbols),
+                coverage=sync_report.coverage,
+            )
             logger.info(
                 f"{sync_report.target_date} 不是交易日；不运行策略，不生成或发送 TXT"
             )
@@ -306,6 +383,26 @@ def main() -> None:
                 logger.info(
                     f"{strategy_name} 无已核验选股结果"
                 )
+
+        recorded_rows = engine.record_verified_selections(
+            sync_report=sync_report,
+            strategy_results=strategy_results,
+            executed_strategies=[type(strategy).__name__ for strategy in strategies],
+        )
+        logger.info(
+            f"已原子保存 {sync_report.target_date} 的完整选股历史，"
+            f"共 {recorded_rows} 条策略命中记录"
+        )
+        export_state_path = _write_gpt_export_state(
+            settings,
+            status="complete",
+            market_date=sync_report.target_date,
+            expected_symbols=sync_report.expected_symbols,
+            verified_symbols=len(sync_report.verified_symbols),
+            coverage=sync_report.coverage,
+            selection_result_rows=recorded_rows,
+        )
+        logger.info(f"已写入 GPT 数据库导出状态：{export_state_path}")
 
         if strategy_results:
             notifier = EmailNotifier(settings)

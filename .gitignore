@@ -18,6 +18,8 @@ ENV/
 
 # 数据库文件
 data/*.db
+gpt-export/
+reports/
 
 # 环境变量
 .env
@@ -30,6 +32,11 @@ build/
 # 测试与工具缓存
 .pytest_cache/
 .ruff_cache/
+.tmp/
+.pip-tmp/
+.smoke-manual/
+.manual-pytest/
+.gpt-export-smoke-*/
 
 # 日志
 *.log
