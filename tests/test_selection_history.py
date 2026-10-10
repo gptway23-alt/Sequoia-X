@@ -101,6 +101,30 @@ def test_records_and_atomically_replaces_complete_selection_date(tmp_path) -> No
     assert result_rows == 1
 
 
+def test_identical_rerun_preserves_original_recorded_time(tmp_path) -> None:
+    engine = _engine(tmp_path)
+    report = _complete_report()
+    strategy_results = {"StrategyA": ["000001"], "StrategyB": ["600519"]}
+    strategies = ["StrategyA", "StrategyB"]
+    engine.record_verified_selections(report, strategy_results, strategies)
+    sentinel = "2026-10-08T00:00:00+00:00"
+    with sqlite3.connect(engine.db_path) as connection:
+        connection.execute(
+            "UPDATE selection_runs SET recorded_at = ? WHERE market_date = ?",
+            (sentinel, "2026-10-08"),
+        )
+
+    written = engine.record_verified_selections(report, strategy_results, strategies)
+
+    with sqlite3.connect(engine.db_path) as connection:
+        recorded_at = connection.execute(
+            "SELECT recorded_at FROM selection_runs WHERE market_date = ?",
+            ("2026-10-08",),
+        ).fetchone()[0]
+    assert written == 2
+    assert recorded_at == sentinel
+
+
 def test_rejects_incomplete_or_unverified_results_without_writing(tmp_path) -> None:
     engine = _engine(tmp_path)
     incomplete = SyncReport(
