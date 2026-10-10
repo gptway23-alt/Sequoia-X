@@ -39,17 +39,36 @@ class FeishuNotifier:
 
     @staticmethod
     def _get_stock_names(symbols: list[str]) -> dict[str, str]:
-        """通过 baostock 批量查询股票名称，返回 {code: name} 映射。"""
+        """尽力查询名称；登录或单股失败时回退为代码且不影响通知。"""
         import baostock as bs
-        bs.login()
-        mapping = {}
-        for code in symbols:
-            prefix = "sh" if code.startswith(("6", "9")) else "sz"
-            rs = bs.query_stock_basic(code=f"{prefix}.{code}")
-            while rs.next():
-                row = rs.get_row_data()
-                mapping[code] = row[1]  # 第2个字段是股票名称
-        bs.logout()
+        from sequoia_x.data.engine import _login_with_retry, _safe_logout
+
+        mapping: dict[str, str] = {}
+        login_error = _login_with_retry(bs, max_attempts=2, backoff_seconds=0.5)
+        if login_error is not None:
+            logger.warning(f"股票名称查询登录失败，使用代码显示：{login_error}")
+            return mapping
+
+        try:
+            for code in symbols:
+                prefix = "sh" if code.startswith(("6", "9")) else "sz"
+                try:
+                    rs = bs.query_stock_basic(code=f"{prefix}.{code}")
+                    if getattr(rs, "error_code", None) != "0":
+                        logger.warning(
+                            f"[{code}] 股票名称查询失败："
+                            f"{getattr(rs, 'error_msg', 'unknown error')}"
+                        )
+                        continue
+                    while rs.next():
+                        row = list(rs.get_row_data())
+                        if len(row) > 1 and row[1]:
+                            mapping[code] = row[1]
+                            break
+                except Exception as exc:
+                    logger.warning(f"[{code}] 股票名称响应异常，使用代码显示：{exc}")
+        finally:
+            _safe_logout(bs)
         return mapping
 
     def _build_card(self, symbols: list[str], strategy_name: str) -> dict:
@@ -79,7 +98,11 @@ class FeishuNotifier:
                         "tag": "div",
                         "text": {
                             "tag": "lark_md",
-                            "content": f"**日期：** {today}\n**策略：** {strategy_name}\n**选股数量：** {len(symbols)}",
+                            "content": (
+                                f"**日期：** {today}\n"
+                                f"**策略：** {strategy_name}\n"
+                                f"**选股数量：** {len(symbols)}"
+                            ),
                         },
                     },
                     {"tag": "hr"},
