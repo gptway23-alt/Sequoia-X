@@ -54,7 +54,8 @@ class PrivatePlacementStrategy(BaseStrategy):
 
         df["发行日期"] = pd.to_datetime(df["发行日期"], errors="coerce")
         df = df.dropna(subset=["发行日期"])
-        df = df[df["发行日期"].dt.date >= cutoff]
+        issue_dates = df["发行日期"].dt.date
+        df = df[(issue_dates >= cutoff) & (issue_dates <= today)]
 
         if df.empty:
             logger.info("PrivatePlacementStrategy 近期无新定增公告")
