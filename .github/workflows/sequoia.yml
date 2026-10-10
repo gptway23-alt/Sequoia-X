@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
 
     # 首次全市场历史回填耗时明显长于日常增量；GitHub job 上限为 360 分钟。
-    timeout-minutes: 300
+    timeout-minutes: 360
 
     env:
       TZ: Asia/Shanghai
@@ -40,6 +40,9 @@ jobs:
       EMAIL_REPORT_DIR: reports
       GPT_EXPORT_DIR: gpt-export
       GPT_EXPORT_STATE_PATH: reports/gpt-export-state.json
+      DATABASE_EMAIL_PACKAGE_DIR: reports/database-email
+      DATABASE_EMAIL_PART_BYTES: "16777216"
+      DATABASE_EMAIL_MAX_PARTS: "24"
 
     steps:
       - name: Checkout repository
@@ -135,7 +138,7 @@ jobs:
 
       - name: Verify database before cache save
         id: verify_db
-        if: always()
+        if: ${{ !cancelled() }}
         continue-on-error: true
         run: |
           python - <<'PY'
@@ -162,7 +165,8 @@ jobs:
       # Save integrity-checked progress before building or uploading large artifacts.
       - name: Save database
         id: save_db
-        if: always() && steps.verify_db.outcome == 'success'
+        if: ${{ !cancelled() && steps.verify_db.outcome == 'success' }}
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: data
@@ -170,7 +174,7 @@ jobs:
 
       - name: Check verified GPT export readiness
         id: gpt_export_ready
-        if: always() && steps.verify_db.outcome == 'success'
+        if: ${{ !cancelled() && steps.verify_db.outcome == 'success' }}
         continue-on-error: true
         env:
           RUN_OUTCOME: ${{ steps.run_sequoia.outcome }}
@@ -260,7 +264,7 @@ jobs:
 
       - name: Build verified GPT database snapshot
         id: export_gpt_db
-        if: steps.gpt_export_ready.outputs.ready == 'true'
+        if: ${{ !cancelled() && steps.gpt_export_ready.outputs.ready == 'true' }}
         continue-on-error: true
         timeout-minutes: 20
         env:
@@ -274,7 +278,8 @@ jobs:
 
       - name: Upload verified GPT database
         id: upload_gpt_db
-        if: always() && steps.export_gpt_db.outcome == 'success'
+        if: ${{ !cancelled() && steps.export_gpt_db.outcome == 'success' }}
+        continue-on-error: true
         timeout-minutes: 20
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -284,8 +289,28 @@ jobs:
           retention-days: 7
           compression-level: 9
 
+      - name: Email verified GPT database
+        id: email_gpt_db
+        if: ${{ !cancelled() && steps.export_gpt_db.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 60
+        env:
+          REQUIRED_MARKET_DATE: ${{ steps.gpt_export_ready.outputs.target_date }}
+          DATABASE_DOWNLOAD_URL: ${{ steps.upload_gpt_db.outputs.artifact-url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: |
+          python -m sequoia_x.notify.database_email \
+            --export-dir "$GPT_EXPORT_DIR" \
+            --package-dir "$DATABASE_EMAIL_PACKAGE_DIR" \
+            --market-date "$REQUIRED_MARKET_DATE" \
+            --part-bytes "$DATABASE_EMAIL_PART_BYTES" \
+            --max-parts "$DATABASE_EMAIL_MAX_PARTS" \
+            --minimum-coverage "$MIN_DAILY_COVERAGE" \
+            --download-url "$DATABASE_DOWNLOAD_URL"
+
       - name: Upload verified TXT reports
-        if: always()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sequoia-txt-${{ github.run_id }}-${{ github.run_attempt }}
@@ -296,15 +321,18 @@ jobs:
       # The data cache is already saved above. This final step preserves the
       # red status for incomplete market data or any earlier execution failure.
       - name: Preserve final job status
-        if: always()
+        if: ${{ !cancelled() }}
         env:
           INITIALIZE_OUTCOME: ${{ steps.initialize_db.outcome }}
           PREFLIGHT_OUTCOME: ${{ steps.preflight_db.outcome }}
           RUN_OUTCOME: ${{ steps.run_sequoia.outcome }}
           VERIFY_OUTCOME: ${{ steps.verify_db.outcome }}
+          SAVE_OUTCOME: ${{ steps.save_db.outcome }}
           GPT_EXPORT_READY_OUTCOME: ${{ steps.gpt_export_ready.outcome }}
           GPT_EXPORT_READY: ${{ steps.gpt_export_ready.outputs.ready }}
           GPT_EXPORT_OUTCOME: ${{ steps.export_gpt_db.outcome }}
+          GPT_UPLOAD_OUTCOME: ${{ steps.upload_gpt_db.outcome }}
+          GPT_EMAIL_OUTCOME: ${{ steps.email_gpt_db.outcome }}
         run: |
           failed=0
 
@@ -322,6 +350,9 @@ jobs:
           if [ "$VERIFY_OUTCOME" != "success" ]; then
             echo "::error::Database failed the final integrity check and was not cached."
             failed=1
+          elif [ "$SAVE_OUTCOME" != "success" ]; then
+            echo "::error::Verified database progress could not be saved to cache."
+            failed=1
           fi
 
           if [ "$VERIFY_OUTCOME" = "success" ] && [ "$GPT_EXPORT_READY_OUTCOME" != "success" ]; then
@@ -331,6 +362,16 @@ jobs:
 
           if [ "$GPT_EXPORT_READY" = "true" ] && [ "$GPT_EXPORT_OUTCOME" != "success" ]; then
             echo "::error::Verified data existed, but the GPT database export failed."
+            failed=1
+          fi
+
+          if [ "$GPT_EXPORT_OUTCOME" = "success" ] && [ "$GPT_UPLOAD_OUTCOME" != "success" ]; then
+            echo "::error::Verified GPT database export was not uploaded as an Artifact."
+            failed=1
+          fi
+
+          if [ "$GPT_EXPORT_OUTCOME" = "success" ] && [ "$GPT_EMAIL_OUTCOME" != "success" ]; then
+            echo "::error::Verified GPT database email delivery was incomplete."
             failed=1
           fi
 
