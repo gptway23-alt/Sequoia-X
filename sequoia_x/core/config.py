@@ -16,12 +16,14 @@ class Settings(BaseSettings):
     baostock_max_attempts: int = 3
     baostock_backoff_seconds: float = 1.0
     baostock_socket_timeout_seconds: float = 20.0
-    min_daily_coverage: float = 0.98
+    min_daily_coverage: float = Field(default=0.98, gt=0.0, le=1.0)
+    daily_sync_not_before: str = "15:30"
 
     # Gmail 凭据仍由 GitHub Actions secrets / 环境变量提供。
     gmail_user: str | None = None
     gmail_app_password: str | None = None
     email_report_dir: str = "reports"
+    gpt_export_state_path: str = "reports/gpt-export-state.json"
 
     model_config = SettingsConfigDict(
         env_file=".env",
