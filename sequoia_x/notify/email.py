@@ -33,10 +33,25 @@ class SentCheckError(RuntimeError):
     """Raised when Gmail SENT cannot be checked safely."""
 
 
+class EmailDeliveryError(RuntimeError):
+    """Raised after one or more fixed recipients were not delivered."""
+
+
 class EmailSendStatus(str, Enum):
     SENT = "sent"
     ALREADY_SENT = "already_sent"
+    RESUMED = "resumed"
     EMPTY = "empty"
+
+
+@dataclass(frozen=True)
+class EmailRecipientDelivery:
+    """Delivery evidence for one fixed recipient."""
+
+    recipient: str
+    message_id: str
+    status: EmailSendStatus
+    attempts: int
 
 
 @dataclass(frozen=True)
@@ -44,10 +59,17 @@ class EmailSendResult:
     """Outcome and evidence for one aggregate report delivery attempt."""
 
     status: EmailSendStatus
-    message_id: str | None
+    message_ids: tuple[str, ...]
     attempts: int
     symbols: tuple[str, ...]
     report_path: Path
+    deliveries: tuple[EmailRecipientDelivery, ...]
+
+    @property
+    def message_id(self) -> str | None:
+        """Return the sole ID for legacy single-recipient results, if any."""
+
+        return self.message_ids[0] if len(self.message_ids) == 1 else None
 
     @property
     def symbol_count(self) -> int:
@@ -157,61 +179,74 @@ class EmailNotifier:
         if not report_symbols:
             return EmailSendResult(
                 status=EmailSendStatus.EMPTY,
-                message_id=None,
+                message_ids=(),
                 attempts=0,
                 symbols=(),
                 report_path=report_path,
+                deliveries=(),
             )
 
-        message_id = self._message_id(
-            normalized_date,
-            report_text,
-            self.recipients,
-        )
-        if self._is_in_sent(message_id):
-            return EmailSendResult(
-                status=EmailSendStatus.ALREADY_SENT,
-                message_id=message_id,
-                attempts=0,
-                symbols=report_symbols,
-                report_path=report_path,
+        deliveries: list[EmailRecipientDelivery] = []
+        failures: list[str] = []
+        for recipient in self.recipients:
+            message_id = self._message_id(
+                normalized_date,
+                report_text,
+                (recipient,),
             )
-
-        message = self._build_message(
-            report_text=report_text,
-            report_symbols=report_symbols,
-            market_date=normalized_date,
-            message_id=message_id,
-        )
-
-        attempts = 0
-        while attempts < 2:
-            attempts += 1
             try:
-                self._send_smtp(message)
-                return EmailSendResult(
-                    status=EmailSendStatus.SENT,
+                status, attempts = self._deliver_message(
                     message_id=message_id,
-                    attempts=attempts,
-                    symbols=report_symbols,
-                    report_path=report_path,
+                    build_message=lambda recipient=recipient, message_id=message_id: (
+                        self._build_message(
+                            report_text=report_text,
+                            report_symbols=report_symbols,
+                            market_date=normalized_date,
+                            message_id=message_id,
+                            recipient=recipient,
+                        )
+                    ),
                 )
             except Exception as exc:
-                if attempts >= 2 or not self._is_temporary_smtp_error(exc):
-                    raise
+                failures.append(
+                    f"recipient={recipient}, error={type(exc).__name__}: {exc}"
+                )
+                if isinstance(exc, (SentCheckError, smtplib.SMTPAuthenticationError)):
+                    break
+                continue
+            deliveries.append(
+                EmailRecipientDelivery(
+                    recipient=recipient,
+                    message_id=message_id,
+                    status=status,
+                    attempts=attempts,
+                )
+            )
 
-                # SMTP may have accepted the message before the client saw an
-                # error. Re-check SENT before the sole permitted retry.
-                if self._is_in_sent(message_id):
-                    return EmailSendResult(
-                        status=EmailSendStatus.ALREADY_SENT,
-                        message_id=message_id,
-                        attempts=attempts,
-                        symbols=report_symbols,
-                        report_path=report_path,
-                    )
+        if failures:
+            raise EmailDeliveryError(
+                "TXT email delivery was incomplete; re-run to resume missing recipients: "
+                + " | ".join(failures)
+            )
 
-        raise AssertionError("unreachable")
+        sent = sum(item.status is EmailSendStatus.SENT for item in deliveries)
+        skipped = sum(
+            item.status is EmailSendStatus.ALREADY_SENT for item in deliveries
+        )
+        if sent and skipped:
+            overall_status = EmailSendStatus.RESUMED
+        elif sent:
+            overall_status = EmailSendStatus.SENT
+        else:
+            overall_status = EmailSendStatus.ALREADY_SENT
+        return EmailSendResult(
+            status=overall_status,
+            message_ids=tuple(item.message_id for item in deliveries),
+            attempts=sum(item.attempts for item in deliveries),
+            symbols=report_symbols,
+            report_path=report_path,
+            deliveries=tuple(deliveries),
+        )
 
     @staticmethod
     def _validate_market_date(market_date: str) -> str:
@@ -292,11 +327,12 @@ class EmailNotifier:
         report_symbols: tuple[str, ...],
         market_date: str,
         message_id: str,
+        recipient: str,
     ) -> EmailMessage:
         message = EmailMessage()
         message["Subject"] = f"Sequoia-X | {market_date} | {len(report_symbols)}只"
         message["From"] = self.user
-        message["To"] = ", ".join(self.recipients)
+        message["To"] = recipient
         message["Message-ID"] = message_id
         message.set_content(
             "Sequoia-X 已核验选股结果见附件。\n"
@@ -311,6 +347,40 @@ class EmailNotifier:
             filename=f"sequoia-x-{market_date}.txt",
         )
         return message
+
+    def _deliver_message(
+        self,
+        *,
+        message_id: str,
+        build_message: Callable[[], EmailMessage],
+    ) -> tuple[EmailSendStatus, int]:
+        """Deliver one deterministic message with SENT-backed idempotency.
+
+        The message body and attachments are built only after the first SENT
+        lookup. A transient SMTP failure permits one retry, preceded by a
+        second SENT lookup to cover ambiguous server acceptance.
+        """
+
+        if self._is_in_sent(message_id):
+            return EmailSendStatus.ALREADY_SENT, 0
+
+        message = build_message()
+        attempts = 0
+        while attempts < 2:
+            attempts += 1
+            try:
+                self._send_smtp(message)
+                return EmailSendStatus.SENT, attempts
+            except Exception as exc:
+                if attempts >= 2 or not self._is_temporary_smtp_error(exc):
+                    raise
+
+                # SMTP may have accepted the message before the client saw an
+                # error. Re-check SENT before the sole permitted retry.
+                if self._is_in_sent(message_id):
+                    return EmailSendStatus.ALREADY_SENT, attempts
+
+        raise AssertionError("unreachable")
 
     def _is_in_sent(self, message_id: str) -> bool:
         client = None
