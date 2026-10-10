@@ -15,9 +15,10 @@ from pathlib import Path
 from typing import Any
 
 
-RECIPIENTS: tuple[str, str] = (
+RECIPIENTS: tuple[str, str, str] = (
     "1044757346@qq.com",
     "739152015@qq.com",
+    "gptway23@gmail.com",
 )
 _SYMBOL_RE = re.compile(r"^[0-9]{6}$")
 _SENT_FLAG_RE = re.compile(r"(?:^|[\s(])\\Sent(?:[\s)])", re.IGNORECASE)
@@ -86,7 +87,7 @@ class EmailNotifier:
             configured=getattr(settings, "gmail_app_password", None),
             environment_key="GMAIL_APP_PASSWORD",
         )
-        self.recipients = self._recipient_list((*RECIPIENTS, self.user))
+        self.recipients = self._recipient_list(RECIPIENTS)
         configured_report_dir = getattr(settings, "email_report_dir", None)
         selected_report_dir = report_dir if report_dir is not None else configured_report_dir
         self.report_dir = Path(selected_report_dir or "reports")
