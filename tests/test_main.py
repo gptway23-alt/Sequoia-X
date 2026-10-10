@@ -17,7 +17,11 @@ import main as main_module
 def test_main_exits_nonzero_on_exception(error_msg: str) -> None:
     """属性 13：main() 中任意未捕获异常应导致 sys.exit(1)。"""
     # patch main 模块中直接引用的 get_settings
-    with patch.object(main_module, "get_settings", side_effect=RuntimeError(error_msg)):
+    with patch.object(sys, "argv", ["main.py"]), patch.object(
+        main_module,
+        "get_settings",
+        side_effect=RuntimeError(error_msg),
+    ):
         with pytest.raises(SystemExit) as exc_info:
             main_module.main()
         assert exc_info.value.code != 0

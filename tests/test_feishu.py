@@ -1,10 +1,8 @@
 """飞书通知属性测试。"""
 
 import json
-import logging
 from unittest.mock import MagicMock, patch
 
-import pytest
 from hypothesis import given, settings as h_settings
 from hypothesis import strategies as st
 
@@ -33,12 +31,21 @@ def test_notification_contains_all_symbols(symbols: list[str]) -> None:
     settings = make_settings()
     notifier = FeishuNotifier(settings)
 
-    with patch("requests.post") as mock_post:
+    with patch.object(notifier, "_get_stock_names", return_value={}), patch(
+        "requests.post"
+    ) as mock_post:
         mock_post.return_value = MagicMock(status_code=200)
+        mock_post.return_value.json.return_value = {"code": 0}
         notifier.send(symbols=symbols, strategy_name="TestStrategy")
 
     call_args = mock_post.call_args
-    body = json.loads(call_args.kwargs.get("data") or call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs["data"])
+    raw_body = (
+        call_args.kwargs.get("data")
+        or call_args.args[1]
+        if len(call_args.args) > 1
+        else call_args.kwargs["data"]
+    )
+    body = json.loads(raw_body)
     card_text = json.dumps(body)
     for symbol in symbols:
         assert symbol in card_text
@@ -46,7 +53,10 @@ def test_notification_contains_all_symbols(symbols: list[str]) -> None:
 
 # Feature: sequoia-x-v2, Property 11: 飞书通知使用 ConfigManager 中的 Webhook URL
 @given(
-    webhook_url=st.from_regex(r"https://open\.feishu\.cn/open-apis/bot/v2/hook/[a-z0-9\-]{8,36}", fullmatch=True)
+    webhook_url=st.from_regex(
+        r"https://open\.feishu\.cn/open-apis/bot/v2/hook/[a-z0-9\-]{8,36}",
+        fullmatch=True,
+    )
 )
 @h_settings(max_examples=50)
 def test_notification_uses_config_url(webhook_url: str) -> None:
@@ -54,11 +64,18 @@ def test_notification_uses_config_url(webhook_url: str) -> None:
     settings = make_settings(webhook_url=webhook_url)
     notifier = FeishuNotifier(settings)
 
-    with patch("requests.post") as mock_post:
+    with patch.object(notifier, "_get_stock_names", return_value={}), patch(
+        "requests.post"
+    ) as mock_post:
         mock_post.return_value = MagicMock(status_code=200)
+        mock_post.return_value.json.return_value = {"code": 0}
         notifier.send(symbols=["000001"], strategy_name="Test", webhook_key="default")
 
-    called_url = mock_post.call_args.args[0] if mock_post.call_args.args else mock_post.call_args.kwargs.get("url")
+    called_url = (
+        mock_post.call_args.args[0]
+        if mock_post.call_args.args
+        else mock_post.call_args.kwargs.get("url")
+    )
     assert called_url == webhook_url
 
 
@@ -84,8 +101,11 @@ def test_http_failure_logs_error(status_code: int) -> None:
     handler = _ListHandler(_logging.ERROR)
     feishu_logger.addHandler(handler)
     try:
-        with patch("requests.post") as mock_post:
+        with patch.object(notifier, "_get_stock_names", return_value={}), patch(
+            "requests.post"
+        ) as mock_post:
             mock_post.return_value = MagicMock(status_code=status_code, text="error")
+            mock_post.return_value.json.return_value = {"code": 1}
             notifier.send(symbols=["000001"], strategy_name="Test")
     finally:
         feishu_logger.removeHandler(handler)

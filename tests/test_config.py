@@ -1,8 +1,11 @@
 """配置管理属性测试。"""
 
 import os
+
+import pytest
 from hypothesis import HealthCheck, given, settings as h_settings
 from hypothesis import strategies as st
+from pydantic import ValidationError
 
 
 # Feature: sequoia-x-v2, Property 1: 环境变量覆盖配置默认值
@@ -44,3 +47,22 @@ def test_notification_credentials_are_optional_at_startup() -> None:
         for key, value in backup.items():
             if value is not None:
                 os.environ[key] = value
+
+
+def test_daily_sync_cutoff_can_be_configured(monkeypatch) -> None:
+    """上海收盘门禁时间必须能由 DAILY_SYNC_NOT_BEFORE 覆盖。"""
+    from sequoia_x.core.config import Settings
+
+    monkeypatch.setenv("DAILY_SYNC_NOT_BEFORE", "16:05")
+    configured = Settings(_env_file=None)
+
+    assert configured.daily_sync_not_before == "16:05"
+
+
+@pytest.mark.parametrize("value", [0.0, -0.1, 1.01, float("nan")])
+def test_invalid_daily_coverage_is_rejected(value: float) -> None:
+    """覆盖率门禁配置错误时必须停止，不能静默放宽数据完整性要求。"""
+    from sequoia_x.core.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(min_daily_coverage=value, _env_file=None)
