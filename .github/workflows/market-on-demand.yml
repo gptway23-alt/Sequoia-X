@@ -1,0 +1,203 @@
+
+name: Sequoia-X On-demand BaoStock
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "A股六位代码，例如 301363"
+        type: string
+        required: true
+        default: "301363"
+      start_date:
+        description: "起始日期 YYYY-MM-DD"
+        type: string
+        required: true
+        default: "2026-07-01"
+      end_date:
+        description: "终止日期 YYYY-MM-DD"
+        type: string
+        required: true
+        default: "2026-10-09"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sequoia-on-demand-publication
+  cancel-in-progress: false
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Python 3.11
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.11"
+
+      - name: Install BaoStock
+        run: python -m pip install 'baostock>=0.9,<1'
+
+      - name: Query one symbol without SQLite
+        env:
+          SYMBOL: ${{ inputs.symbol }}
+          START_DATE: ${{ inputs.start_date }}
+          END_DATE: ${{ inputs.end_date }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from datetime import date, datetime, timezone
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          import baostock as bs
+          from sequoia_x.data.market_api import fetch_raw
+
+          symbol = os.environ["SYMBOL"].strip()
+          start = os.environ["START_DATE"].strip()
+          end = os.environ["END_DATE"].strip()
+
+          if not re.fullmatch(r"[034689][0-9]{5}", symbol):
+              raise SystemExit("Invalid six-digit stock symbol")
+
+          try:
+              start_day = date.fromisoformat(start)
+              end_day = date.fromisoformat(end)
+          except ValueError as exc:
+              raise SystemExit("Dates must be YYYY-MM-DD") from exc
+
+          if start_day > end_day or (end_day - start_day).days > 400:
+              raise SystemExit(
+                  "Use a date range of 0 to 400 calendar days"
+              )
+
+          if end_day > datetime.now(
+              ZoneInfo("Asia/Shanghai")
+          ).date():
+              raise SystemExit("Future end_date is not allowed")
+
+          result = bs.login()
+          if result.error_code != "0":
+              raise SystemExit(
+                  f"BaoStock login failed: {result.error_msg}"
+              )
+
+          try:
+              rows = fetch_raw(bs, symbol, start, end)
+          finally:
+              bs.logout()
+
+          bars = [
+              dict(
+                  date=d,
+                  open=o,
+                  high=h,
+                  low=lo,
+                  close=c,
+                  volume=vol,
+                  turnover=amt
+              )
+              for _, d, o, h, lo, c, vol, amt in rows
+          ]
+
+          payload = {
+              "schema_version": 1,
+              "symbol": symbol,
+              "source": "baostock_query_history_k_data_plus",
+              "adjustment": "NONE",
+              "frequency": "1d",
+              "request": {
+                  "start": start,
+                  "end": end
+              },
+              "fetched_at_utc": datetime.now(
+                  timezone.utc
+              ).isoformat(),
+              "price_asof": (
+                  bars[-1]["date"] if bars else None
+              ),
+              "is_realtime": False,
+              "count": len(bars),
+              "status": "OK" if bars else "NO_DATA",
+              "bars": bars
+          }
+
+          output = (
+              Path(os.environ["RUNNER_TEMP"])
+              / "market-data.json"
+          )
+          output.write_text(
+              json.dumps(
+                  payload,
+                  ensure_ascii=False,
+                  separators=(",", ":")
+              ),
+              encoding="utf-8"
+          )
+
+          print(
+              f"symbol={symbol}, "
+              f"bars={len(bars)}, "
+              f"price_asof={payload['price_asof']}"
+          )
+          PY
+
+      - name: Upload result as artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: stock-${{ inputs.symbol }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/market-data.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish to market-data branch
+        env:
+          SYMBOL: ${{ inputs.symbol }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code \
+              --heads origin market-data >/dev/null; then
+
+            git fetch --depth=1 origin market-data
+            git checkout -B market-data FETCH_HEAD
+
+          else
+            git checkout --orphan market-data
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+
+          target="on-demand/${SYMBOL}/${GITHUB_RUN_ID}.json"
+
+          mkdir -p "$(dirname "$target")"
+          cp "$RUNNER_TEMP/market-data.json" "$target"
+
+          git add -- "$target"
+          git commit -m "data: ${SYMBOL} run ${GITHUB_RUN_ID}"
+          git push origin HEAD:refs/heads/market-data
+
+          url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/market-data/${target}"
+
+          {
+            echo "### 按需行情已发布"
+            echo
+            echo "$target"
+            echo
+            echo "$url"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          printf 'Result URL: %s\n' "$url"
