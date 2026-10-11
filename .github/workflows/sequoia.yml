@@ -5,13 +5,13 @@ on:
   workflow_dispatch:
     inputs:
       target_date:
-        description: "目标交易日 YYYY-MM-DD，留空使用默认日期"
+        description: "可选目标交易日（YYYY-MM-DD）；留空时使用程序默认日期"
         required: false
-        default: ""
         type: string
+        default: ""
 
-  # UTC 11:15 = 北京时间 19:15
   schedule:
+    # UTC 11:15 = Beijing time 19:15, weekdays.
     - cron: "15 11 * * 1-5"
 
 concurrency:
@@ -26,79 +26,68 @@ permissions:
 jobs:
   run-sequoia:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+
+    # 首次全市场历史回填耗时明显长于日常增量；GitHub job 上限为 360 分钟。
+    timeout-minutes: 360
 
     env:
       TZ: Asia/Shanghai
       DB_PATH: data/sequoia_v2.db
       START_DATE: "2024-01-01"
-
       BAOSTOCK_MAX_WORKERS: "2"
       BAOSTOCK_BATCH_SIZE: "40"
       BAOSTOCK_MAX_ATTEMPTS: "3"
       BAOSTOCK_BACKOFF_SECONDS: "1.0"
       BAOSTOCK_SOCKET_TIMEOUT_SECONDS: "20"
-
       MIN_DAILY_COVERAGE: "0.98"
       EMAIL_REPORT_DIR: reports
-
       GPT_EXPORT_DIR: gpt-export
       GPT_EXPORT_STATE_PATH: reports/gpt-export-state.json
+      RAW_SYNC_MAX_SYMBOLS: "0"   # 0=all until time budget; resume next run
+      RAW_SYNC_TIME_BUDGET_SECONDS: "3600"
+      RAW_PAGES_LIMIT_MB: "900"
 
     steps:
-
-      # =============================================
-      # 1. 初始化环境
-      # =============================================
-
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.15"
 
+      # 严格使用仓库中的 uv.lock；随后把隔离环境放入后续步骤的 PATH。
       - name: Install dependencies
         run: |
           uv sync --locked --extra dev --python 3.11
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
-      - name: Verify engine compatibility
+      - name: Verify source bundle compatibility
         run: |
-          python - <<'PY'
-          import main
-          from sequoia_x.data.engine import ENGINE_API_VERSION
-
-          assert (
-              ENGINE_API_VERSION
-              == main.REQUIRED_ENGINE_API_VERSION
-              == 3
-          )
-          print("Engine compatibility: OK")
-          PY
+          python -c "import main; from sequoia_x.data.engine import ENGINE_API_VERSION; assert ENGINE_API_VERSION == main.REQUIRED_ENGINE_API_VERSION == 3"
 
       - name: Run offline regression tests
         run: pytest -q
 
-      # =============================================
-      # 2. 恢复数据库
-      # =============================================
-
+      # 安装完成后再恢复 SQLite 数据库
       - name: Restore database
-        id: restore_db
-        uses: actions/cache/restore@v4
+        id: restore-db
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: data
-          key: sequoia-db-v3-${{ github.run_id }}-${{ github.run_attempt }}
+          # Cache entries are immutable. Include run_attempt so a re-run can
+          # save newer, verified progress under the same workflow run_id.
+          key: sequoia-db-raw-v1-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            sequoia-db-raw-v1-
             sequoia-db-v3-
             sequoia-db-v2-
 
@@ -109,17 +98,13 @@ jobs:
         run: |
           mkdir -p data
 
-          if [ ! -f "$DB_PATH" ]; then
-            echo "Database missing. Starting backfill."
+          if [ ! -f data/sequoia_v2.db ]; then
+            echo "Database not found, starting backfill..."
             python main.py --backfill
           else
-            echo "Database restored."
-            ls -lh "$DB_PATH"
+            echo "Existing database restored."
+            ls -lh data/sequoia_v2.db
           fi
-
-      # =============================================
-      # 3. 数据库完整性检查
-      # =============================================
 
       - name: Validate database before daily run
         id: preflight_db
@@ -131,35 +116,14 @@ jobs:
           import sqlite3
 
           path = os.environ["DB_PATH"]
-
-          if not os.path.isfile(path):
-              raise SystemExit("Database does not exist")
-
-          if os.path.getsize(path) <= 0:
-              raise SystemExit("Database is empty")
-
-          with sqlite3.connect(
-              f"file:{path}?mode=rw",
-              uri=True,
-          ) as conn:
-              result = conn.execute(
-                  "PRAGMA quick_check"
-              ).fetchone()
-
-          if result != ("ok",):
-              raise SystemExit(
-                  f"SQLite integrity failed: {result}"
-              )
-
-          print("Database integrity: OK")
+          if not os.path.isfile(path) or os.path.getsize(path) == 0:
+              raise SystemExit(f"Database is missing or empty: {path}")
+          with sqlite3.connect(f"file:{path}?mode=rw", uri=True) as connection:
+              result = connection.execute("PRAGMA quick_check").fetchone()
+              if not result or result[0] != "ok":
+                  raise SystemExit(f"SQLite quick_check failed: {result}")
+          print("SQLite quick_check: ok")
           PY
-
-      # =============================================
-      # 4. 运行选股程序
-      #
-      # 保留 TXT 选股报告邮件
-      # 不发送数据库 ZIP 或分片邮件
-      # =============================================
 
       - name: Run Sequoia-X
         id: run_sequoia
@@ -168,22 +132,16 @@ jobs:
           steps.preflight_db.outcome == 'success'
         continue-on-error: true
         timeout-minutes: 60
-
         env:
           TARGET_DATE: ${{ inputs.target_date }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-
         run: |
           if [ -n "$TARGET_DATE" ]; then
             python main.py --target-date "$TARGET_DATE"
           else
             python main.py
           fi
-
-      # =============================================
-      # 5. 更新及保存历史数据库
-      # =============================================
 
       - name: Verify database before cache save
         id: verify_db
@@ -195,166 +153,89 @@ jobs:
           import sqlite3
 
           path = os.environ["DB_PATH"]
+          if not os.path.isfile(path) or os.path.getsize(path) == 0:
+              raise SystemExit(f"Database is missing or empty: {path}")
 
-          if (
-              not os.path.isfile(path)
-              or os.path.getsize(path) <= 0
-          ):
-              raise SystemExit(
-                  "Database missing or empty"
-              )
-
-          with sqlite3.connect(
-              f"file:{path}?mode=rw",
-              uri=True,
-              timeout=30,
-          ) as conn:
-
-              checkpoint = conn.execute(
-                  "PRAGMA wal_checkpoint(FULL)"
-              ).fetchone()
-
+          # Use read/write mode without allowing sqlite3 to create a missing
+          # file. A successful checkpoint makes the cached DB self-contained
+          # even if the application selected WAL journal mode.
+          with sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=30) as connection:
+              checkpoint = connection.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
               if checkpoint and checkpoint[0] != 0:
-                  raise SystemExit(
-                      f"WAL checkpoint busy: {checkpoint}"
-                  )
-
-              result = conn.execute(
-                  "PRAGMA quick_check"
-              ).fetchone()
-
-              if result != ("ok",):
-                  raise SystemExit(
-                      f"Database verification failed: {result}"
-                  )
-
-          print("Final database check: OK")
+                  raise SystemExit(f"SQLite WAL checkpoint is busy: {checkpoint}")
+              result = connection.execute("PRAGMA quick_check").fetchone()
+              if not result or result[0] != "ok":
+                  raise SystemExit(f"SQLite quick_check failed: {result}")
+          print("SQLite quick_check: ok")
           PY
 
+      # Save integrity-checked progress before building or uploading large artifacts.
       - name: Save database
         id: save_db
         if: ${{ !cancelled() && steps.verify_db.outcome == 'success' }}
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: data
           key: sequoia-db-v3-${{ github.run_id }}-${{ github.run_attempt }}
-
-      # =============================================
-      # 6. 验证数据库导出状态
-      # =============================================
 
       - name: Check verified GPT export readiness
         id: gpt_export_ready
         if: ${{ !cancelled() && steps.verify_db.outcome == 'success' }}
         continue-on-error: true
-
         env:
           RUN_OUTCOME: ${{ steps.run_sequoia.outcome }}
           CURRENT_RUN_ID: ${{ github.run_id }}
           CURRENT_RUN_ATTEMPT: ${{ github.run_attempt }}
-
         run: |
           python - <<'PY'
           import json
           import math
           import os
           import sqlite3
-
           from datetime import date
           from pathlib import Path
 
-          state_path = Path(
-              os.environ["GPT_EXPORT_STATE_PATH"]
-          )
-
+          state_path = Path(os.environ["GPT_EXPORT_STATE_PATH"])
+          run_outcome = os.environ["RUN_OUTCOME"]
           if not state_path.is_file():
-              if os.environ["RUN_OUTCOME"] == "success":
+              if run_outcome == "success":
                   raise SystemExit(
-                      "Missing run state after successful run"
+                      "Sequoia-X succeeded without a machine-readable run state"
                   )
-
-              with open(
-                  os.environ["GITHUB_OUTPUT"],
-                  "a",
-                  encoding="utf-8",
-              ) as f:
-                  f.write("ready=false\n")
-                  f.write("status=failed_before_commit\n")
-
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("ready=false\n")
+                  output.write("status=failed_before_commit\n")
+              print("No current-run export state; verified export is unavailable")
               raise SystemExit(0)
 
-          state = json.loads(
-              state_path.read_text(encoding="utf-8")
-          )
-
+          state = json.loads(state_path.read_text(encoding="utf-8"))
           if state.get("schema_version") != 1:
               raise SystemExit(
-                  "Unsupported run-state schema"
+                  f"Unsupported run-state schema_version: {state.get('schema_version')!r}"
               )
-
           status = str(state.get("status", ""))
-
-          if status not in {
-              "complete",
-              "non_trading_day",
-              "before_cutoff",
-          }:
-              raise SystemExit(
-                  f"Invalid run-state status: {status}"
-              )
-
-          raw_date = str(
-              state.get("market_date", "")
-          )
-
+          if status not in {"complete", "non_trading_day", "before_cutoff"}:
+              raise SystemExit(f"Invalid run-state status: {status!r}")
+          raw_date = str(state.get("market_date", ""))
           try:
-              target_date = date.fromisoformat(
-                  raw_date
-              ).isoformat()
+              target_date = date.fromisoformat(raw_date).isoformat()
           except ValueError as exc:
-              raise SystemExit(
-                  "Invalid market date"
-              ) from exc
-
+              raise SystemExit(f"Invalid run-state market_date: {raw_date!r}") from exc
           if target_date != raw_date:
-              raise SystemExit(
-                  "Non-canonical market date"
-              )
-
-          if str(state.get("source_run_id")) != \
-                  os.environ["CURRENT_RUN_ID"]:
-              raise SystemExit(
-                  "Run ID mismatch"
-              )
-
-          if str(state.get("source_run_attempt")) != \
-                  os.environ["CURRENT_RUN_ATTEMPT"]:
-              raise SystemExit(
-                  "Run attempt mismatch"
-              )
+              raise SystemExit(f"Non-canonical run-state market_date: {raw_date!r}")
+          if str(state.get("source_run_id")) != os.environ["CURRENT_RUN_ID"]:
+              raise SystemExit("Run-state source_run_id does not match this workflow run")
+          if str(state.get("source_run_attempt")) != os.environ["CURRENT_RUN_ATTEMPT"]:
+              raise SystemExit("Run-state source_run_attempt does not match this attempt")
 
           ready = status == "complete"
-
           if ready:
-              expected = int(
-                  state["expected_symbols"]
-              )
-              verified = int(
-                  state["verified_symbols"]
-              )
-              coverage = float(
-                  state["coverage"]
-              )
-              result_rows = int(
-                  state["selection_result_rows"]
-              )
-
-              calculated = (
-                  verified / expected
-                  if expected > 0 else 0
-              )
-
+              expected = int(state["expected_symbols"])
+              verified = int(state["verified_symbols"])
+              coverage = float(state["coverage"])
+              result_rows = int(state["selection_result_rows"])
+              calculated = verified / expected if expected > 0 else 0.0
               if (
                   expected <= 0
                   or verified <= 0
@@ -362,72 +243,39 @@ jobs:
                   or result_rows < 0
                   or not math.isfinite(coverage)
                   or abs(coverage - calculated) > 1e-12
-                  or coverage < float(
-                      os.environ["MIN_DAILY_COVERAGE"]
-                  )
+                  or coverage < float(os.environ["MIN_DAILY_COVERAGE"])
               ):
-                  raise SystemExit(
-                      "Invalid complete run state"
-                  )
+                  raise SystemExit(f"Invalid complete run state: {state}")
 
-              with sqlite3.connect(
-                  f"file:{os.environ['DB_PATH']}?mode=ro",
-                  uri=True,
-              ) as conn:
-                  row = conn.execute(
-                      """
-                      SELECT
-                          expected_symbols,
-                          verified_symbols,
-                          coverage,
-                          result_rows
-                      FROM selection_runs
-                      WHERE market_date = ?
-                      """,
+          if ready:
+              path = os.environ["DB_PATH"]
+              with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
+                  row = connection.execute(
+                      "SELECT expected_symbols, verified_symbols, coverage, result_rows "
+                      "FROM selection_runs WHERE market_date = ?",
                       (target_date,),
                   ).fetchone()
-
-              if row is None or tuple(row) != (
-                  expected,
-                  verified,
-                  coverage,
-                  result_rows,
-              ):
+              expected_row = (expected, verified, coverage, result_rows)
+              if row is None or tuple(row) != expected_row:
                   raise SystemExit(
-                      "Run state/database mismatch"
+                      f"Run state does not match committed selection history: "
+                      f"state={expected_row}, database={row}"
                   )
 
-          with open(
-              os.environ["GITHUB_OUTPUT"],
-              "a",
-              encoding="utf-8",
-          ) as f:
-              f.write(
-                  f"ready={'true' if ready else 'false'}\n"
-              )
-              f.write(f"status={status}\n")
-              f.write(f"target_date={target_date}\n")
-
-          print(
-              f"Export ready={ready}, "
-              f"status={status}, "
-              f"date={target_date}"
-          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"ready={'true' if ready else 'false'}\n")
+              output.write(f"status={status}\n")
+              output.write(f"target_date={target_date}\n")
+          print(f"GPT export ready={ready}, status={status}, target_date={target_date}")
           PY
-
-      # =============================================
-      # 7. 导出数据库快照
-      # =============================================
 
       - name: Build verified GPT database snapshot
         id: export_gpt_db
         if: ${{ !cancelled() && steps.gpt_export_ready.outputs.ready == 'true' }}
         continue-on-error: true
         timeout-minutes: 20
-
         env:
           REQUIRED_MARKET_DATE: ${{ steps.gpt_export_ready.outputs.target_date }}
-
         run: |
           python -m sequoia_x.data.gpt_export \
             --source "$DB_PATH" \
@@ -435,15 +283,12 @@ jobs:
             --required-market-date "$REQUIRED_MARKET_DATE" \
             --minimum-coverage "$MIN_DAILY_COVERAGE"
 
-      # 仅保存 GitHub Artifact
-      # 不发送数据库 ZIP 邮件
-
       - name: Upload verified GPT database
         id: upload_gpt_db
         if: ${{ !cancelled() && steps.export_gpt_db.outcome == 'success' }}
         continue-on-error: true
         timeout-minutes: 20
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sequoia-gpt-database-${{ steps.gpt_export_ready.outputs.target_date }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.GPT_EXPORT_DIR }}/
@@ -451,350 +296,154 @@ jobs:
           retention-days: 7
           compression-level: 9
 
-      # =============================================
-      # 8. 导出未复权历史行情 JSON
-      # =============================================
-
-      - name: Export Sequoia-X raw price API
-        id: export_market_api
+      # Full original-stock universe, from the local post-adjusted DB symbol list.
+      # Create an INDEPENDENT unadjusted OHLC table (adjustflag=3).
+      # Interrupted/backfill-partial runs resume via the new raw DB cache.
+      - name: Sync full-universe raw OHLC cache
+        id: sync_raw_market
         if: ${{ !cancelled() && steps.export_gpt_db.outcome == 'success' }}
         continue-on-error: true
-        timeout-minutes: 60
-
+        timeout-minutes: 75
         env:
           REQUIRED_MARKET_DATE: ${{ steps.gpt_export_ready.outputs.target_date }}
-
         run: |
           python -m sequoia_x.data.market_api \
+            --mode sync \
+            --db "$DB_PATH" \
+            --market-date "$REQUIRED_MARKET_DATE" \
+            --max-symbols "$RAW_SYNC_MAX_SYMBOLS" \
+            --time-budget-seconds "$RAW_SYNC_TIME_BUDGET_SECONDS"
+
+      - name: Save full-universe raw database progress
+        id: save_raw_cache
+        if: ${{ !cancelled() && steps.sync_raw_market.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: sequoia-db-raw-v1-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # All historical dates, all original market symbols, plus yearly
+      # compressed JSONL files for full bulk downloads. Incomplete = PARTIAL.
+      - name: Export full-market raw price API
+        id: export_market_api
+        if: ${{ !cancelled() && steps.save_raw_cache.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 35
+        env:
+          REQUIRED_MARKET_DATE: ${{ steps.gpt_export_ready.outputs.target_date }}
+        run: |
+          python -m sequoia_x.data.market_api \
+            --mode publish \
+            --db "$DB_PATH" \
             --snapshot "$GPT_EXPORT_DIR/sequoia-x-verified.sqlite3" \
             --manifest "$GPT_EXPORT_DIR/manifest.json" \
             --output "public/api/v1" \
-            --market-date "$REQUIRED_MARKET_DATE"
-
-      # =============================================
-      # 9. 新增：GitHub Pages 发布前检查
-      #
-      # 已启用 Pages -> 直接通过
-      #
-      # 未启用 Pages 且存在 PAGES_SETUP_TOKEN
-      # -> 调用 GitHub API 创建 Pages
-      #
-      # 未启用且无令牌
-      # -> 明确失败并提示手动启用
-      # =============================================
-
-      - name: Check or enable GitHub Pages
-        id: pages_ready
-        if: ${{ !cancelled() && steps.export_market_api.outcome == 'success' }}
-        continue-on-error: true
-        timeout-minutes: 5
-
-        env:
-          REPOSITORY: ${{ github.repository }}
-          DEFAULT_TOKEN: ${{ github.token }}
-          SETUP_TOKEN: ${{ secrets.PAGES_SETUP_TOKEN }}
-
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          import time
-          import urllib.error
-          import urllib.request
-
-          repository = os.environ["REPOSITORY"]
-          setup_token = os.environ.get(
-              "SETUP_TOKEN", ""
-          )
-          token = (
-              setup_token
-              or os.environ["DEFAULT_TOKEN"]
-          )
-
-          url = (
-              "https://api.github.com/repos/"
-              + repository
-              + "/pages"
-          )
-
-          def request(method, payload=None):
-              data = (
-                  json.dumps(payload).encode("utf-8")
-                  if payload is not None
-                  else None
-              )
-
-              req = urllib.request.Request(
-                  url,
-                  data=data,
-                  method=method,
-                  headers={
-                      "Accept": "application/vnd.github+json",
-                      "Authorization": f"Bearer {token}",
-                      "X-GitHub-Api-Version": "2022-11-28",
-                      "Content-Type": "application/json",
-                  },
-              )
-
-              try:
-                  with urllib.request.urlopen(
-                      req,
-                      timeout=30,
-                  ) as response:
-                      body = response.read()
-                      result = (
-                          json.loads(body)
-                          if body
-                          else {}
-                      )
-                      return response.status, result
-
-              except urllib.error.HTTPError as exc:
-                  body = exc.read().decode(
-                      "utf-8",
-                      errors="replace",
-                  )
-                  return exc.code, {
-                      "message": body[:600]
-                  }
-
-          status, site = request("GET")
-
-          if status == 404:
-              print(
-                  "Pages site not found. "
-                  "Attempting initial setup."
-              )
-
-              if not setup_token:
-                  raise SystemExit(
-                      "::error::GitHub Pages is not enabled. "
-                      "Open Settings > Pages > Source "
-                      "and select GitHub Actions. "
-                      "Alternatively configure PAGES_SETUP_TOKEN."
-                  )
-
-              create_status, result = request(
-                  "POST",
-                  {"build_type": "workflow"},
-              )
-
-              if create_status not in (200, 201, 409):
-                  raise SystemExit(
-                      "::error::Cannot create Pages site: "
-                      f"HTTP {create_status}, {result}"
-                  )
-
-              for attempt in range(5):
-                  time.sleep(3)
-                  status, site = request("GET")
-                  if status == 200:
-                      break
-
-          if status != 200:
-              raise SystemExit(
-                  "::error::Cannot access GitHub Pages: "
-                  f"HTTP {status}, {site}"
-              )
-
-          build_type = site.get("build_type")
-
-          if build_type == "legacy":
-              if not setup_token:
-                  raise SystemExit(
-                      "::error::Pages is configured for "
-                      "branch publishing. Change Source "
-                      "to GitHub Actions in repository Settings."
-                  )
-
-              update_status, result = request(
-                  "PUT",
-                  {"build_type": "workflow"},
-              )
-
-              if update_status not in (200, 204):
-                  raise SystemExit(
-                      "::error::Cannot switch Pages to "
-                      f"Actions: HTTP {update_status}, {result}"
-                  )
-
-          print("GitHub Pages site accessible.")
-          print(
-              "Site:",
-              site.get("html_url", "not yet assigned"),
-          )
-          print("Pages preflight: OK")
-          PY
-
-      # =============================================
-      # 10. 配置 GitHub Pages
-      #
-      # 此时站点应已存在
-      # 不再让 configure-pages 尝试首次启用
-      # =============================================
+            --market-date "$REQUIRED_MARKET_DATE" \
+            --pages-limit-mb "$RAW_PAGES_LIMIT_MB"
 
       - name: Configure GitHub Pages
+        if: ${{ !cancelled() && steps.export_market_api.outcome == 'success' }}
         id: configure_pages
-        if: ${{ !cancelled() && steps.pages_ready.outcome == 'success' }}
         continue-on-error: true
         uses: actions/configure-pages@v5
 
-      # =============================================
-      # 11. 上传 Pages 网站文件
-      # =============================================
-
       - name: Upload Market API Pages artifact
-        id: upload_pages
         if: ${{ !cancelled() && steps.configure_pages.outcome == 'success' }}
+        id: upload_pages
         continue-on-error: true
         uses: actions/upload-pages-artifact@v4
         with:
           path: public
 
-      # =============================================
-      # 12. 正式发布行情接口
-      # =============================================
-
       - name: Publish Market API
-        id: deployment
         if: ${{ !cancelled() && steps.upload_pages.outcome == 'success' }}
+        id: deployment
         continue-on-error: true
         uses: actions/deploy-pages@v4
 
-      # =============================================
-      # 13. 保存选股 TXT 报告
-      # =============================================
-
       - name: Upload verified TXT reports
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sequoia-txt-${{ github.run_id }}-${{ github.run_attempt }}
           path: reports/*.txt
           if-no-files-found: ignore
           retention-days: 14
 
-      # =============================================
-      # 14. 最终任务状态审计
-      #
-      # 将数据库失败与 Pages 失败分别报告
-      # 不把 Pages 404 误判为行情导出失败
-      # =============================================
-
+      # The data cache is already saved above. This final step preserves the
+      # red status for incomplete market data or any earlier execution failure.
       - name: Preserve final job status
         if: ${{ !cancelled() }}
-
         env:
           INITIALIZE_OUTCOME: ${{ steps.initialize_db.outcome }}
           PREFLIGHT_OUTCOME: ${{ steps.preflight_db.outcome }}
           RUN_OUTCOME: ${{ steps.run_sequoia.outcome }}
-
           VERIFY_OUTCOME: ${{ steps.verify_db.outcome }}
           SAVE_OUTCOME: ${{ steps.save_db.outcome }}
-
           GPT_EXPORT_READY_OUTCOME: ${{ steps.gpt_export_ready.outcome }}
           GPT_EXPORT_READY: ${{ steps.gpt_export_ready.outputs.ready }}
           GPT_EXPORT_OUTCOME: ${{ steps.export_gpt_db.outcome }}
           GPT_UPLOAD_OUTCOME: ${{ steps.upload_gpt_db.outcome }}
-
+          RAW_SYNC_OUTCOME: ${{ steps.sync_raw_market.outcome }}
+          RAW_CACHE_OUTCOME: ${{ steps.save_raw_cache.outcome }}
           MARKET_API_EXPORT_OUTCOME: ${{ steps.export_market_api.outcome }}
-          PAGES_READY_OUTCOME: ${{ steps.pages_ready.outcome }}
-          PAGES_CONFIG_OUTCOME: ${{ steps.configure_pages.outcome }}
-          PAGES_UPLOAD_OUTCOME: ${{ steps.upload_pages.outcome }}
           MARKET_API_DEPLOY_OUTCOME: ${{ steps.deployment.outcome }}
-
         run: |
           failed=0
 
-          echo "=================================="
-          echo "Sequoia-X execution status"
-          echo "=================================="
-
-          echo "Initialization: $INITIALIZE_OUTCOME"
-          echo "Preflight: $PREFLIGHT_OUTCOME"
-          echo "Daily selection: $RUN_OUTCOME"
-          echo "Database verification: $VERIFY_OUTCOME"
-          echo "Database cache: $SAVE_OUTCOME"
-          echo "Snapshot export: $GPT_EXPORT_OUTCOME"
-          echo "Snapshot artifact: $GPT_UPLOAD_OUTCOME"
-          echo "Raw price API: $MARKET_API_EXPORT_OUTCOME"
-          echo "Pages preflight: $PAGES_READY_OUTCOME"
-          echo "Pages configuration: $PAGES_CONFIG_OUTCOME"
-          echo "Pages artifact: $PAGES_UPLOAD_OUTCOME"
-          echo "Pages deployment: $MARKET_API_DEPLOY_OUTCOME"
-
           if [ "$INITIALIZE_OUTCOME" != "success" ]; then
-            echo "::error::Database initialization failed."
+            echo "::error::Database initialization/backfill failed. Verified progress was cached when possible."
             failed=1
           elif [ "$PREFLIGHT_OUTCOME" != "success" ]; then
-            echo "::error::Database preflight failed."
+            echo "::error::Database validation failed before the daily run."
             failed=1
           elif [ "$RUN_OUTCOME" != "success" ]; then
-            echo "::error::Sequoia-X daily selection failed."
+            echo "::error::Sequoia-X did not complete. Verified database progress was cached for the next run."
             failed=1
           fi
 
           if [ "$VERIFY_OUTCOME" != "success" ]; then
-            echo "::error::Database integrity verification failed."
+            echo "::error::Database failed the final integrity check and was not cached."
             failed=1
           elif [ "$SAVE_OUTCOME" != "success" ]; then
-            echo "::error::Database cache save failed."
+            echo "::error::Verified database progress could not be saved to cache."
             failed=1
           fi
 
-          if [ "$VERIFY_OUTCOME" = "success" ] && \
-             [ "$GPT_EXPORT_READY_OUTCOME" != "success" ]; then
-            echo "::error::GPT export readiness check failed."
+          if [ "$VERIFY_OUTCOME" = "success" ] && [ "$GPT_EXPORT_READY_OUTCOME" != "success" ]; then
+            echo "::error::Could not validate GPT database export readiness."
             failed=1
           fi
 
-          if [ "$GPT_EXPORT_READY" = "true" ] && \
-             [ "$GPT_EXPORT_OUTCOME" != "success" ]; then
-            echo "::error::Verified GPT database export failed."
+          if [ "$GPT_EXPORT_READY" = "true" ] && [ "$GPT_EXPORT_OUTCOME" != "success" ]; then
+            echo "::error::Verified data existed, but the GPT database export failed."
             failed=1
           fi
 
-          if [ "$GPT_EXPORT_OUTCOME" = "success" ] && \
-             [ "$GPT_UPLOAD_OUTCOME" != "success" ]; then
-            echo "::error::Database Artifact backup failed."
+          if [ "$GPT_EXPORT_OUTCOME" = "success" ] && [ "$GPT_UPLOAD_OUTCOME" != "success" ]; then
+            echo "::error::Verified GPT database export was not uploaded as an Artifact."
             failed=1
           fi
 
-          if [ "$GPT_EXPORT_OUTCOME" = "success" ] && \
-             [ "$MARKET_API_EXPORT_OUTCOME" != "success" ]; then
-            echo "::error::Raw price API JSON export failed."
+          if [ "$GPT_EXPORT_OUTCOME" = "success" ] && [ "$RAW_SYNC_OUTCOME" != "success" ]; then
+            echo "::error::Full-universe unadjusted OHLC sync failed."
             failed=1
           fi
 
-          if [ "$MARKET_API_EXPORT_OUTCOME" = "success" ]; then
-
-            if [ "$PAGES_READY_OUTCOME" != "success" ]; then
-              echo "::error::GitHub Pages is unavailable."
-              echo "::error::Check Settings > Pages > Source."
-              echo "::error::Choose GitHub Actions or configure PAGES_SETUP_TOKEN."
-              failed=1
-
-            elif [ "$PAGES_CONFIG_OUTCOME" != "success" ]; then
-              echo "::error::Configure GitHub Pages failed."
-              failed=1
-
-            elif [ "$PAGES_UPLOAD_OUTCOME" != "success" ]; then
-              echo "::error::Pages artifact upload failed."
-              failed=1
-
-            elif [ "$MARKET_API_DEPLOY_OUTCOME" != "success" ]; then
-              echo "::error::Market API deployment failed."
-              failed=1
-
-            else
-              echo "Market API deployment: SUCCESS"
-            fi
+          if [ "$RAW_SYNC_OUTCOME" = "success" ] && [ "$RAW_CACHE_OUTCOME" != "success" ]; then
+            echo "::error::Full-universe price cache could not be saved."
+            failed=1
           fi
 
-          if [ "$failed" -eq 0 ]; then
-            echo "Sequoia-X workflow: SUCCESS"
-          else
-            echo "::error::Sequoia-X workflow completed with errors."
+          if [ "$RAW_CACHE_OUTCOME" = "success" ] && [ "$MARKET_API_EXPORT_OUTCOME" != "success" ]; then
+            echo "::error::Full-market raw API export failed, check Pages size limit."
+            failed=1
+          fi
+
+          if [ "$MARKET_API_EXPORT_OUTCOME" = "success" ] && [ "$MARKET_API_DEPLOY_OUTCOME" != "success" ]; then
+            echo "::error::GitHub Pages market API deploy failed."
+            failed=1
           fi
 
           exit "$failed"
