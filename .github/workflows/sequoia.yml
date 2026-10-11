@@ -4,18 +4,22 @@ name: Sequoia-X Daily
 on:
   workflow_dispatch:
     inputs:
-      target_date:
-        description: "可选目标交易日（YYYY-MM-DD）；留空时使用程序默认日期"
+      audit_only:
+        description: "仅检查数据库（不运行策略、不发邮件、不生成新缓存）"
+        type: boolean
         required: false
+        default: true
+      target_date:
+        description: "日常模式目标交易日（YYYY-MM-DD），留空使用程序默认日期"
         type: string
+        required: false
         default: ""
-
   schedule:
-    # UTC 11:15 = Beijing time 19:15, weekdays.
+    # UTC 11:15 = 北京时间 19:15，周一至周五
     - cron: "15 11 * * 1-5"
 
 concurrency:
-  group: sequoia-x-daily-mail
+  group: sequoia-x-daily-db
   cancel-in-progress: false
 
 permissions:
@@ -24,12 +28,11 @@ permissions:
 jobs:
   run-sequoia:
     runs-on: ubuntu-24.04
-    # 只读网关不在 Actions 中运行；保留已有策略引擎的定时任务。
     timeout-minutes: 180
-
     env:
       TZ: Asia/Shanghai
       DB_PATH: data/sequoia_v2.db
+      DAILY_MODE: ${{ github.event_name != 'workflow_dispatch' || inputs.audit_only == false }}
       START_DATE: "2024-01-01"
       BAOSTOCK_MAX_WORKERS: "2"
       BAOSTOCK_BATCH_SIZE: "40"
@@ -41,40 +44,18 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.11"
 
-      - name: Set up uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          version: "0.12.15"
-
-      # 严格使用仓库中的 uv.lock；随后把隔离环境放入后续步骤的 PATH。
-      - name: Install dependencies
-        run: |
-          uv sync --locked --extra dev --python 3.11
-          uv pip install --python .venv/bin/python -r requirements-gateway.txt
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
-
-      - name: Verify source bundle compatibility
-        run: |
-          python -c "import main; from sequoia_x.data.engine import ENGINE_API_VERSION; assert ENGINE_API_VERSION == main.REQUIRED_ENGINE_API_VERSION == 3"
-
-      - name: Run offline regression tests
-        run: pytest -q
-
-      # 安装完成后再恢复 SQLite 数据库
       - name: Restore database
-        id: restore-db
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: restore_db
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: data
-          # Cache entries are immutable. Include run_attempt so a re-run can
-          # save newer, verified progress under the same workflow run_id.
           key: sequoia-db-v10-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             sequoia-db-v10-
@@ -83,40 +64,206 @@ jobs:
             sequoia-db-v2-
 
       - name: Require existing strategy database
-        id: initialize_db
+        id: require_db
         continue-on-error: true
+        shell: bash
         run: |
-          if [ ! -s data/sequoia_v2.db ]; then
-            echo "::error::策略数据库不存在。V10 禁止在日常任务中自动全市场回填；请从独立备份恢复策略库。"
+          if [ ! -s "$DB_PATH" ]; then
+            echo "::error::找不到 $DB_PATH。请检查数据库缓存或独立备份。"
             exit 1
           fi
-          echo "Existing STRATEGY database restored; no full-universe RAW sync."
-          ls -lh data/sequoia_v2.db
+          ls -lh "$DB_PATH"
 
-      - name: Validate database before daily run
-        id: preflight_db
-        if: steps.initialize_db.outcome == 'success'
+      - name: Audit database duplicates (read only)
+        id: db_audit
+        if: ${{ steps.require_db.outcome == 'success' }}
         continue-on-error: true
+        shell: bash
         run: |
           python - <<'PY'
           import os
           import sqlite3
+          from pathlib import Path
 
-          path = os.environ["DB_PATH"]
-          if not os.path.isfile(path) or os.path.getsize(path) == 0:
-              raise SystemExit(f"Database is missing or empty: {path}")
-          with sqlite3.connect(f"file:{path}?mode=rw", uri=True) as connection:
-              result = connection.execute("PRAGMA quick_check").fetchone()
-              if not result or result[0] != "ok":
-                  raise SystemExit(f"SQLite quick_check failed: {result}")
-          print("SQLite quick_check: ok")
+          path = Path(os.environ['DB_PATH']).resolve()
+          conn = sqlite3.connect(
+              path.as_uri() + '?mode=ro',
+              uri=True,
+              timeout=30
+          )
+          try:
+              result = conn.execute(
+                  'PRAGMA quick_check'
+              ).fetchone()[0]
+
+              if result != 'ok':
+                  raise SystemExit(
+                      f'SQLite quick_check 失败：{result}'
+                  )
+
+              tables = {
+                  row[0] for row in conn.execute(
+                      "SELECT name FROM sqlite_master "
+                      "WHERE type='table'"
+                  )
+              }
+
+              print(f'数据库文件：{path}')
+              print(
+                  f'文件大小：'
+                  f'{path.stat().st_size / 1024**2:.2f} MiB'
+              )
+              print('SQLite quick_check: ok')
+
+              report = [
+                  '## Sequoia-X 数据库只读审计',
+                  f'- 数据库大小：'
+                  f'{path.stat().st_size / 1024**2:.2f} MiB',
+              ]
+
+              for table in (
+                  'stock_daily',
+                  'stock_daily_raw'
+              ):
+                  if table not in tables:
+                      print(
+                          f'{table}: 不存在（已跳过）'
+                      )
+                      report.append(
+                          f'- `{table}`：不存在'
+                      )
+                      if table == 'stock_daily':
+                          raise SystemExit(
+                              '缺少策略必需的 stock_daily 表'
+                          )
+                      continue
+
+                  columns = {
+                      row[1] for row in conn.execute(
+                          f'PRAGMA table_info("{table}")'
+                      )
+                  }
+
+                  if not {'symbol', 'date'} <= columns:
+                      raise SystemExit(
+                          f'{table} 缺少 symbol/date 列：'
+                          f'{columns}'
+                      )
+
+                  total = conn.execute(
+                      f'SELECT COUNT(*) FROM "{table}"'
+                  ).fetchone()[0]
+
+                  groups, extra = conn.execute(f'''
+                      SELECT
+                          COUNT(*),
+                          COALESCE(SUM(n - 1), 0)
+                      FROM (
+                          SELECT COUNT(*) AS n
+                          FROM "{table}"
+                          GROUP BY symbol, date
+                          HAVING COUNT(*) > 1
+                      )
+                  ''').fetchone()
+
+                  print(
+                      f'{table}: '
+                      f'总记录={total:,}, '
+                      f'重复组合={groups:,}, '
+                      f'多余记录={extra:,}'
+                  )
+
+                  report.append(
+                      f'- `{table}`：'
+                      f'总记录 {total:,}；'
+                      f'重复组合 {groups:,}；'
+                      f'多余记录 {extra:,}'
+                  )
+
+                  if groups:
+                      print(
+                          f'::warning::{table} 发现 '
+                          f'{groups} 组重复股票日期，'
+                          f'请人工核查；未删除数据'
+                      )
+
+              page_size = conn.execute(
+                  'PRAGMA page_size'
+              ).fetchone()[0]
+
+              page_count = conn.execute(
+                  'PRAGMA page_count'
+              ).fetchone()[0]
+
+              free_count = conn.execute(
+                  'PRAGMA freelist_count'
+              ).fetchone()[0]
+
+              free_mib = (
+                  page_size * free_count / 1024**2
+              )
+
+              print(
+                  f'SQLite 空闲可复用页：'
+                  f'{free_mib:.2f} MiB'
+              )
+
+              report.append(
+                  f'- SQLite 空闲可复用页：'
+                  f'{free_mib:.2f} MiB'
+              )
+
+              report.append(
+                  '- 本次只读检查，未删除或修改数据库。'
+              )
+
+              summary = os.environ.get(
+                  'GITHUB_STEP_SUMMARY'
+              )
+
+              if summary:
+                  with open(
+                      summary,
+                      'a',
+                      encoding='utf-8'
+                  ) as f:
+                      f.write(
+                          '\n'.join(report) + '\n'
+                      )
+          finally:
+              conn.close()
           PY
+
+      - name: Set up uv
+        if: ${{ env.DAILY_MODE == 'true' && steps.db_audit.outcome == 'success' }}
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+        with:
+          version: "0.12.15"
+
+      - name: Install dependencies
+        if: ${{ env.DAILY_MODE == 'true' && steps.db_audit.outcome == 'success' }}
+        run: |
+          uv sync --locked --extra dev --python 3.11
+          uv pip install --python .venv/bin/python -r requirements-gateway.txt
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Verify source bundle compatibility
+        if: ${{ env.DAILY_MODE == 'true' && steps.db_audit.outcome == 'success' }}
+        run: |
+          python -c "import main; from sequoia_x.data.engine import ENGINE_API_VERSION; assert ENGINE_API_VERSION == main.REQUIRED_ENGINE_API_VERSION == 3"
+
+      - name: Run offline regression tests
+        id: offline_tests
+        if: ${{ env.DAILY_MODE == 'true' && steps.db_audit.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          python -m pytest -q \
+            --ignore=tests/test_database_email.py \
+            --ignore=tests/test_gpt_export.py
 
       - name: Run Sequoia-X
         id: run_sequoia
-        if: >-
-          steps.initialize_db.outcome == 'success' &&
-          steps.preflight_db.outcome == 'success'
+        if: ${{ env.DAILY_MODE == 'true' && steps.offline_tests.outcome == 'success' }}
         continue-on-error: true
         timeout-minutes: 60
         env:
@@ -132,43 +279,68 @@ jobs:
 
       - name: Verify database before cache save
         id: verify_db
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.DAILY_MODE == 'true' && steps.run_sequoia.outcome != 'skipped' }}
         continue-on-error: true
         run: |
           python - <<'PY'
           import os
           import sqlite3
+          from pathlib import Path
 
-          path = os.environ["DB_PATH"]
-          if not os.path.isfile(path) or os.path.getsize(path) == 0:
-              raise SystemExit(f"Database is missing or empty: {path}")
+          path = Path(
+              os.environ['DB_PATH']
+          ).resolve()
 
-          # Use read/write mode without allowing sqlite3 to create a missing
-          # file. A successful checkpoint makes the cached DB self-contained
-          # even if the application selected WAL journal mode.
-          with sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=30) as connection:
-              checkpoint = connection.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
-              if checkpoint and checkpoint[0] != 0:
-                  raise SystemExit(f"SQLite WAL checkpoint is busy: {checkpoint}")
-              result = connection.execute("PRAGMA quick_check").fetchone()
-              if not result or result[0] != "ok":
-                  raise SystemExit(f"SQLite quick_check failed: {result}")
-          print("SQLite quick_check: ok")
+          if (
+              not path.is_file()
+              or path.stat().st_size == 0
+          ):
+              raise SystemExit(
+                  f'Database missing or empty: {path}'
+              )
+
+          with sqlite3.connect(
+              path.as_uri() + '?mode=rw',
+              uri=True,
+              timeout=30
+          ) as conn:
+              checkpoint = conn.execute(
+                  'PRAGMA wal_checkpoint(FULL)'
+              ).fetchone()
+
+              if (
+                  checkpoint
+                  and checkpoint[0] != 0
+              ):
+                  raise SystemExit(
+                      f'WAL checkpoint busy: '
+                      f'{checkpoint}'
+                  )
+
+              check = conn.execute(
+                  'PRAGMA quick_check'
+              ).fetchone()[0]
+
+              if check != 'ok':
+                  raise SystemExit(
+                      f'SQLite quick_check failed: {check}'
+                  )
+
+          print('Verified database checkpoint: ok')
           PY
 
-      # Exactly ONE full-DB cache checkpoint; never expose it to GPT or publish it.
       - name: Save database
         id: save_db
-        if: ${{ !cancelled() && steps.verify_db.outcome == 'success' }}
+        if: ${{ !cancelled() && env.DAILY_MODE == 'true' && steps.verify_db.outcome == 'success' }}
         continue-on-error: true
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: data
           key: sequoia-db-v10-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload TXT reports only (no database)
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() && env.DAILY_MODE == 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: sequoia-txt-${{ github.run_id }}-${{ github.run_attempt }}
           path: reports/*.txt
@@ -178,17 +350,28 @@ jobs:
       - name: Preserve final status
         if: ${{ !cancelled() }}
         env:
-          INITIALIZE: ${{ steps.initialize_db.outcome }}
-          PREFLIGHT: ${{ steps.preflight_db.outcome }}
+          REQUIRE: ${{ steps.require_db.outcome }}
+          AUDIT: ${{ steps.db_audit.outcome }}
+          TESTS: ${{ steps.offline_tests.outcome }}
           RUN: ${{ steps.run_sequoia.outcome }}
           VERIFY: ${{ steps.verify_db.outcome }}
           SAVE: ${{ steps.save_db.outcome }}
         run: |
-          for status in "$INITIALIZE" "$PREFLIGHT" "$RUN" "$VERIFY" "$SAVE"; do
+          if [ "$REQUIRE" != "success" ] || [ "$AUDIT" != "success" ]; then
+            echo "::error::数据库恢复或只读审计失败: require=$REQUIRE audit=$AUDIT"
+            exit 1
+          fi
+
+          if [ "$DAILY_MODE" != "true" ]; then
+            echo '数据库只读审计完成：未运行策略、未发送邮件、未保存新缓存。'
+            exit 0
+          fi
+
+          for status in "$TESTS" "$RUN" "$VERIFY" "$SAVE"; do
             if [ "$status" != "success" ]; then
-              echo "::error::Main Sequoia-X daily strategy/checkpoint failed: $status"
+              echo "::error::日常策略或数据库检查点失败: $status"
               exit 1
             fi
           done
-          echo "Daily strategy and local database checkpoint succeeded."
-          echo "No GPT database export, Pages raw export, or full-universe raw sync executed."
+
+          echo '日常策略和数据库检查点成功；未执行旧版 RAW 全市场历史回填或 GPT 数据库导出。'
