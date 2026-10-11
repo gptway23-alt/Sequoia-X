@@ -20,18 +20,12 @@ concurrency:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 jobs:
   run-sequoia:
     runs-on: ubuntu-24.04
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-
-    # 首次全市场历史回填耗时明显长于日常增量；GitHub job 上限为 360 分钟。
-    timeout-minutes: 360
+    # 只读网关不在 Actions 中运行；保留已有策略引擎的定时任务。
+    timeout-minutes: 180
 
     env:
       TZ: Asia/Shanghai
@@ -44,11 +38,6 @@ jobs:
       BAOSTOCK_SOCKET_TIMEOUT_SECONDS: "20"
       MIN_DAILY_COVERAGE: "0.98"
       EMAIL_REPORT_DIR: reports
-      GPT_EXPORT_DIR: gpt-export
-      GPT_EXPORT_STATE_PATH: reports/gpt-export-state.json
-      RAW_SYNC_MAX_SYMBOLS: "0"   # 0=all until time budget; resume next run
-      RAW_SYNC_TIME_BUDGET_SECONDS: "3600"
-      RAW_PAGES_LIMIT_MB: "900"
 
     steps:
       - name: Checkout repository
@@ -68,6 +57,7 @@ jobs:
       - name: Install dependencies
         run: |
           uv sync --locked --extra dev --python 3.11
+          uv pip install --python .venv/bin/python -r requirements-gateway.txt
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Verify source bundle compatibility
@@ -85,26 +75,23 @@ jobs:
           path: data
           # Cache entries are immutable. Include run_attempt so a re-run can
           # save newer, verified progress under the same workflow run_id.
-          key: sequoia-db-raw-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          key: sequoia-db-v10-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            sequoia-db-v10-
             sequoia-db-raw-v1-
             sequoia-db-v3-
             sequoia-db-v2-
 
-      - name: Initialize database if needed
+      - name: Require existing strategy database
         id: initialize_db
         continue-on-error: true
-        timeout-minutes: 180
         run: |
-          mkdir -p data
-
-          if [ ! -f data/sequoia_v2.db ]; then
-            echo "Database not found, starting backfill..."
-            python main.py --backfill
-          else
-            echo "Existing database restored."
-            ls -lh data/sequoia_v2.db
+          if [ ! -s data/sequoia_v2.db ]; then
+            echo "::error::策略数据库不存在。V10 禁止在日常任务中自动全市场回填；请从独立备份恢复策略库。"
+            exit 1
           fi
+          echo "Existing STRATEGY database restored; no full-universe RAW sync."
+          ls -lh data/sequoia_v2.db
 
       - name: Validate database before daily run
         id: preflight_db
@@ -169,7 +156,7 @@ jobs:
           print("SQLite quick_check: ok")
           PY
 
-      # Save integrity-checked progress before building or uploading large artifacts.
+      # Exactly ONE full-DB cache checkpoint; never expose it to GPT or publish it.
       - name: Save database
         id: save_db
         if: ${{ !cancelled() && steps.verify_db.outcome == 'success' }}
@@ -177,192 +164,9 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: data
-          key: sequoia-db-v3-${{ github.run_id }}-${{ github.run_attempt }}
+          key: sequoia-db-v10-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Check verified GPT export readiness
-        id: gpt_export_ready
-        if: ${{ !cancelled() && steps.verify_db.outcome == 'success' }}
-        continue-on-error: true
-        env:
-          RUN_OUTCOME: ${{ steps.run_sequoia.outcome }}
-          CURRENT_RUN_ID: ${{ github.run_id }}
-          CURRENT_RUN_ATTEMPT: ${{ github.run_attempt }}
-        run: |
-          python - <<'PY'
-          import json
-          import math
-          import os
-          import sqlite3
-          from datetime import date
-          from pathlib import Path
-
-          state_path = Path(os.environ["GPT_EXPORT_STATE_PATH"])
-          run_outcome = os.environ["RUN_OUTCOME"]
-          if not state_path.is_file():
-              if run_outcome == "success":
-                  raise SystemExit(
-                      "Sequoia-X succeeded without a machine-readable run state"
-                  )
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-                  output.write("ready=false\n")
-                  output.write("status=failed_before_commit\n")
-              print("No current-run export state; verified export is unavailable")
-              raise SystemExit(0)
-
-          state = json.loads(state_path.read_text(encoding="utf-8"))
-          if state.get("schema_version") != 1:
-              raise SystemExit(
-                  f"Unsupported run-state schema_version: {state.get('schema_version')!r}"
-              )
-          status = str(state.get("status", ""))
-          if status not in {"complete", "non_trading_day", "before_cutoff"}:
-              raise SystemExit(f"Invalid run-state status: {status!r}")
-          raw_date = str(state.get("market_date", ""))
-          try:
-              target_date = date.fromisoformat(raw_date).isoformat()
-          except ValueError as exc:
-              raise SystemExit(f"Invalid run-state market_date: {raw_date!r}") from exc
-          if target_date != raw_date:
-              raise SystemExit(f"Non-canonical run-state market_date: {raw_date!r}")
-          if str(state.get("source_run_id")) != os.environ["CURRENT_RUN_ID"]:
-              raise SystemExit("Run-state source_run_id does not match this workflow run")
-          if str(state.get("source_run_attempt")) != os.environ["CURRENT_RUN_ATTEMPT"]:
-              raise SystemExit("Run-state source_run_attempt does not match this attempt")
-
-          ready = status == "complete"
-          if ready:
-              expected = int(state["expected_symbols"])
-              verified = int(state["verified_symbols"])
-              coverage = float(state["coverage"])
-              result_rows = int(state["selection_result_rows"])
-              calculated = verified / expected if expected > 0 else 0.0
-              if (
-                  expected <= 0
-                  or verified <= 0
-                  or verified > expected
-                  or result_rows < 0
-                  or not math.isfinite(coverage)
-                  or abs(coverage - calculated) > 1e-12
-                  or coverage < float(os.environ["MIN_DAILY_COVERAGE"])
-              ):
-                  raise SystemExit(f"Invalid complete run state: {state}")
-
-          if ready:
-              path = os.environ["DB_PATH"]
-              with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
-                  row = connection.execute(
-                      "SELECT expected_symbols, verified_symbols, coverage, result_rows "
-                      "FROM selection_runs WHERE market_date = ?",
-                      (target_date,),
-                  ).fetchone()
-              expected_row = (expected, verified, coverage, result_rows)
-              if row is None or tuple(row) != expected_row:
-                  raise SystemExit(
-                      f"Run state does not match committed selection history: "
-                      f"state={expected_row}, database={row}"
-                  )
-
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"ready={'true' if ready else 'false'}\n")
-              output.write(f"status={status}\n")
-              output.write(f"target_date={target_date}\n")
-          print(f"GPT export ready={ready}, status={status}, target_date={target_date}")
-          PY
-
-      - name: Build verified GPT database snapshot
-        id: export_gpt_db
-        if: ${{ !cancelled() && steps.gpt_export_ready.outputs.ready == 'true' }}
-        continue-on-error: true
-        timeout-minutes: 20
-        env:
-          REQUIRED_MARKET_DATE: ${{ steps.gpt_export_ready.outputs.target_date }}
-        run: |
-          python -m sequoia_x.data.gpt_export \
-            --source "$DB_PATH" \
-            --output "$GPT_EXPORT_DIR" \
-            --required-market-date "$REQUIRED_MARKET_DATE" \
-            --minimum-coverage "$MIN_DAILY_COVERAGE"
-
-      - name: Upload verified GPT database
-        id: upload_gpt_db
-        if: ${{ !cancelled() && steps.export_gpt_db.outcome == 'success' }}
-        continue-on-error: true
-        timeout-minutes: 20
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: sequoia-gpt-database-${{ steps.gpt_export_ready.outputs.target_date }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.GPT_EXPORT_DIR }}/
-          if-no-files-found: error
-          retention-days: 7
-          compression-level: 9
-
-      # Full original-stock universe, from the local post-adjusted DB symbol list.
-      # Create an INDEPENDENT unadjusted OHLC table (adjustflag=3).
-      # Interrupted/backfill-partial runs resume via the new raw DB cache.
-      - name: Sync full-universe raw OHLC cache
-        id: sync_raw_market
-        if: ${{ !cancelled() && steps.export_gpt_db.outcome == 'success' }}
-        continue-on-error: true
-        timeout-minutes: 75
-        env:
-          REQUIRED_MARKET_DATE: ${{ steps.gpt_export_ready.outputs.target_date }}
-        run: |
-          python -m sequoia_x.data.market_api \
-            --mode sync \
-            --db "$DB_PATH" \
-            --market-date "$REQUIRED_MARKET_DATE" \
-            --max-symbols "$RAW_SYNC_MAX_SYMBOLS" \
-            --time-budget-seconds "$RAW_SYNC_TIME_BUDGET_SECONDS"
-
-      - name: Save full-universe raw database progress
-        id: save_raw_cache
-        if: ${{ !cancelled() && steps.sync_raw_market.outcome == 'success' }}
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: data
-          key: sequoia-db-raw-v1-${{ github.run_id }}-${{ github.run_attempt }}
-
-      # All historical dates, all original market symbols, plus yearly
-      # compressed JSONL files for full bulk downloads. Incomplete = PARTIAL.
-      - name: Export full-market raw price API
-        id: export_market_api
-        if: ${{ !cancelled() && steps.save_raw_cache.outcome == 'success' }}
-        continue-on-error: true
-        timeout-minutes: 35
-        env:
-          REQUIRED_MARKET_DATE: ${{ steps.gpt_export_ready.outputs.target_date }}
-        run: |
-          python -m sequoia_x.data.market_api \
-            --mode publish \
-            --db "$DB_PATH" \
-            --snapshot "$GPT_EXPORT_DIR/sequoia-x-verified.sqlite3" \
-            --manifest "$GPT_EXPORT_DIR/manifest.json" \
-            --output "public/api/v1" \
-            --market-date "$REQUIRED_MARKET_DATE" \
-            --pages-limit-mb "$RAW_PAGES_LIMIT_MB"
-
-      - name: Configure GitHub Pages
-        if: ${{ !cancelled() && steps.export_market_api.outcome == 'success' }}
-        id: configure_pages
-        continue-on-error: true
-        uses: actions/configure-pages@v5
-
-      - name: Upload Market API Pages artifact
-        if: ${{ !cancelled() && steps.configure_pages.outcome == 'success' }}
-        id: upload_pages
-        continue-on-error: true
-        uses: actions/upload-pages-artifact@v4
-        with:
-          path: public
-
-      - name: Publish Market API
-        if: ${{ !cancelled() && steps.upload_pages.outcome == 'success' }}
-        id: deployment
-        continue-on-error: true
-        uses: actions/deploy-pages@v4
-
-      - name: Upload verified TXT reports
+      - name: Upload TXT reports only (no database)
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -371,79 +175,20 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      # The data cache is already saved above. This final step preserves the
-      # red status for incomplete market data or any earlier execution failure.
-      - name: Preserve final job status
+      - name: Preserve final status
         if: ${{ !cancelled() }}
         env:
-          INITIALIZE_OUTCOME: ${{ steps.initialize_db.outcome }}
-          PREFLIGHT_OUTCOME: ${{ steps.preflight_db.outcome }}
-          RUN_OUTCOME: ${{ steps.run_sequoia.outcome }}
-          VERIFY_OUTCOME: ${{ steps.verify_db.outcome }}
-          SAVE_OUTCOME: ${{ steps.save_db.outcome }}
-          GPT_EXPORT_READY_OUTCOME: ${{ steps.gpt_export_ready.outcome }}
-          GPT_EXPORT_READY: ${{ steps.gpt_export_ready.outputs.ready }}
-          GPT_EXPORT_OUTCOME: ${{ steps.export_gpt_db.outcome }}
-          GPT_UPLOAD_OUTCOME: ${{ steps.upload_gpt_db.outcome }}
-          RAW_SYNC_OUTCOME: ${{ steps.sync_raw_market.outcome }}
-          RAW_CACHE_OUTCOME: ${{ steps.save_raw_cache.outcome }}
-          MARKET_API_EXPORT_OUTCOME: ${{ steps.export_market_api.outcome }}
-          MARKET_API_DEPLOY_OUTCOME: ${{ steps.deployment.outcome }}
+          INITIALIZE: ${{ steps.initialize_db.outcome }}
+          PREFLIGHT: ${{ steps.preflight_db.outcome }}
+          RUN: ${{ steps.run_sequoia.outcome }}
+          VERIFY: ${{ steps.verify_db.outcome }}
+          SAVE: ${{ steps.save_db.outcome }}
         run: |
-          failed=0
-
-          if [ "$INITIALIZE_OUTCOME" != "success" ]; then
-            echo "::error::Database initialization/backfill failed. Verified progress was cached when possible."
-            failed=1
-          elif [ "$PREFLIGHT_OUTCOME" != "success" ]; then
-            echo "::error::Database validation failed before the daily run."
-            failed=1
-          elif [ "$RUN_OUTCOME" != "success" ]; then
-            echo "::error::Sequoia-X did not complete. Verified database progress was cached for the next run."
-            failed=1
-          fi
-
-          if [ "$VERIFY_OUTCOME" != "success" ]; then
-            echo "::error::Database failed the final integrity check and was not cached."
-            failed=1
-          elif [ "$SAVE_OUTCOME" != "success" ]; then
-            echo "::error::Verified database progress could not be saved to cache."
-            failed=1
-          fi
-
-          if [ "$VERIFY_OUTCOME" = "success" ] && [ "$GPT_EXPORT_READY_OUTCOME" != "success" ]; then
-            echo "::error::Could not validate GPT database export readiness."
-            failed=1
-          fi
-
-          if [ "$GPT_EXPORT_READY" = "true" ] && [ "$GPT_EXPORT_OUTCOME" != "success" ]; then
-            echo "::error::Verified data existed, but the GPT database export failed."
-            failed=1
-          fi
-
-          if [ "$GPT_EXPORT_OUTCOME" = "success" ] && [ "$GPT_UPLOAD_OUTCOME" != "success" ]; then
-            echo "::error::Verified GPT database export was not uploaded as an Artifact."
-            failed=1
-          fi
-
-          if [ "$GPT_EXPORT_OUTCOME" = "success" ] && [ "$RAW_SYNC_OUTCOME" != "success" ]; then
-            echo "::error::Full-universe unadjusted OHLC sync failed."
-            failed=1
-          fi
-
-          if [ "$RAW_SYNC_OUTCOME" = "success" ] && [ "$RAW_CACHE_OUTCOME" != "success" ]; then
-            echo "::error::Full-universe price cache could not be saved."
-            failed=1
-          fi
-
-          if [ "$RAW_CACHE_OUTCOME" = "success" ] && [ "$MARKET_API_EXPORT_OUTCOME" != "success" ]; then
-            echo "::error::Full-market raw API export failed, check Pages size limit."
-            failed=1
-          fi
-
-          if [ "$MARKET_API_EXPORT_OUTCOME" = "success" ] && [ "$MARKET_API_DEPLOY_OUTCOME" != "success" ]; then
-            echo "::error::GitHub Pages market API deploy failed."
-            failed=1
-          fi
-
-          exit "$failed"
+          for status in "$INITIALIZE" "$PREFLIGHT" "$RUN" "$VERIFY" "$SAVE"; do
+            if [ "$status" != "success" ]; then
+              echo "::error::Main Sequoia-X daily strategy/checkpoint failed: $status"
+              exit 1
+            fi
+          done
+          echo "Daily strategy and local database checkpoint succeeded."
+          echo "No GPT database export, Pages raw export, or full-universe raw sync executed."
