@@ -194,6 +194,94 @@ jobs:
           )
           PY
 
+      - name: Deliver market JSON to GPT-readable Gmail
+        env:
+          SMTP_USER: ${{ secrets.SEQUOIA_SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SEQUOIA_SMTP_PASSWORD }}
+          SMTP_RECIPIENT: gptway23@gmail.com
+          SYMBOL: ${{ inputs.symbol }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import smtplib
+          import ssl
+          from email.message import EmailMessage
+          from pathlib import Path
+
+          path = (
+              Path(os.environ["RUNNER_TEMP"])
+              / "market-data.json"
+          )
+
+          if not path.is_file():
+              raise SystemExit("Market JSON not found")
+
+          payload = json.loads(
+              path.read_text(encoding="utf-8")
+          )
+
+          if payload.get("status") != "OK":
+              raise SystemExit(
+                  "Market data status is not OK"
+              )
+
+          if payload.get("symbol") != os.environ["SYMBOL"]:
+              raise SystemExit("Symbol mismatch")
+
+          bars = payload.get("bars", [])
+          if not bars:
+              raise SystemExit("No market bars")
+
+          sender = os.environ["SMTP_USER"]
+          recipient = os.environ["SMTP_RECIPIENT"]
+
+          if not sender or not os.environ["SMTP_PASSWORD"]:
+              raise SystemExit("SMTP secrets missing")
+
+          message = EmailMessage()
+          message["From"] = sender
+          message["To"] = recipient
+          message["Subject"] = (
+              "[SEQUOIA-MARKET] "
+              f"{payload['symbol']} "
+              f"{payload['price_asof']} "
+              f"run-{os.environ['GITHUB_RUN_ID']}"
+          )
+
+          # JSON 放入邮件正文，方便 GPT 直接读取
+          message.set_content(
+              json.dumps(
+                  payload,
+                  ensure_ascii=False,
+                  separators=(",", ":")
+              ),
+              charset="utf-8"
+          )
+
+          context = ssl.create_default_context()
+
+          with smtplib.SMTP_SSL(
+              "smtp.gmail.com",
+              465,
+              context=context,
+              timeout=30
+          ) as smtp:
+              smtp.login(
+                  sender,
+                  os.environ["SMTP_PASSWORD"]
+              )
+              smtp.send_message(message)
+
+          print(
+              "Market JSON sent to Gmail; "
+              f"symbol={payload['symbol']}; "
+              f"bars={len(bars)}; "
+              f"run={os.environ['GITHUB_RUN_ID']}"
+          )
+          PY
+
       - name: Upload result as artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
