@@ -44,3 +44,9 @@ build/
 
 # Hypothesis 测试缓存
 .hypothesis/
+
+# V10 gateway secrets, backups and future sqlite sidecars
+.env.gateway
+backups/
+data/*.db-*
+data/*.sqlite3*

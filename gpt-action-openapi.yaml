@@ -1,0 +1,84 @@
+openapi: 3.1.0
+info:
+  title: Sequoia-X V10 Read-only A-share Market Data
+  version: 10.0.0
+  description: Only returns BaoStock raw daily OHLCV. No database, order or write endpoints.
+servers:
+  - url: https://REPLACE-WITH-YOUR-HTTPS-DOMAIN
+paths:
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Check Sequoia-X market gateway health
+      security:
+        - GatewayBearer: []
+      responses:
+        '200':
+          description: Gateway is ready
+  /v1/stocks/{symbol}/daily:
+    get:
+      operationId: getAshareDailyBars
+      summary: Get mainland A-share unadjusted historical daily bars
+      description: Historical OHLCV via BaoStock adjustflag=3, not live quotes or guaranteed executable trade prices.
+      security:
+        - GatewayBearer: []
+      parameters:
+        - in: path
+          name: symbol
+          required: true
+          schema:
+            type: string
+            pattern: '^[036489][0-9]{5}$'
+          description: Six-digit mainland stock code, such as 301363 or 600519.
+        - in: query
+          name: start
+          required: true
+          schema:
+            type: string
+            format: date
+          description: First requested market date, YYYY-MM-DD.
+        - in: query
+          name: end
+          required: true
+          schema:
+            type: string
+            format: date
+          description: Last requested market date, YYYY-MM-DD. Max 400 calendar days after start.
+      responses:
+        '200':
+          description: Historical daily bars and freshness metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  schema_version: {type: integer}
+                  symbol: {type: string}
+                  source: {type: string}
+                  adjustment: {type: string}
+                  frequency: {type: string}
+                  fetched_at_utc: {type: string}
+                  price_asof: {type: [string, 'null']}
+                  count: {type: integer}
+                  status: {type: string}
+                  is_realtime: {type: boolean}
+                  bars:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        date: {type: string}
+                        open: {type: number}
+                        high: {type: number}
+                        low: {type: number}
+                        close: {type: number}
+                        volume: {type: number}
+                        turnover: {type: number}
+        '401': {description: Unauthorized}
+        '422': {description: Invalid symbol or date window}
+        '502': {description: Provider unavailable}
+components:
+  securitySchemes:
+    GatewayBearer:
+      type: http
+      scheme: bearer

@@ -10,7 +10,7 @@ Sequoia-X V2 是面向 A 股市场的量化选股系统，基于现代 Python �
 系统以 OOP 架构、向量化计算和增量数据更新为核心设计原则，每日收盘后自动选股并发送 TXT 邮件。
 
 当前股票池显式覆盖沪深主板与**创业板（300xxx / 301xxx）**。
-日常运行会自动检测本地 SQLite 中缺失的受支持股票并回填，因此旧缓存数据库升级后
+原有策略引擎仍可能检测本地 SQLite 中缺失的受支持股票并补齐，因此旧缓存数据库升级后
 无需删除重建即可补入创业板股票。
 
 数据层使用 [baostock](http://baostock.com)（免费、无需注册、无限流）拉取历史及增量日 K 数据（后复权），
@@ -101,7 +101,7 @@ Sequoia-X/
 │   │   └── logger.py            # rich 结构化日志
 │   ├── data/
 │   │   ├── engine.py            # 数据引擎（baostock 回填 + 增量同步 + SQLite）
-│   │   └── gpt_export.py        # 已发布行情与已核验选股历史的安全快照
+│   │   └── market_api.py        # 未复权 BaoStock fetch_raw，供只读网关复用
 │   ├── strategy/
 │   │   ├── base.py              # 策略抽象基类
 │   │   ├── turtle_trade.py      # 海龟交易策略
@@ -113,7 +113,7 @@ Sequoia-X/
 │   │   └── private_placement.py # 定增事件策略
 │   └── notify/
 │       ├── email.py             # TXT 报告、SENT 去重和有限重试
-│       ├── database_email.py    # 已核验数据库压缩、分片与邮件发送
+│       ├── ..                   # 不再包含数据库邮件功能
 │       └── feishu.py            # 可选的飞书 Webhook 推送
 └── tests/                       # 属性测试（hypothesis）
 ```
@@ -126,57 +126,25 @@ Sequoia-X/
 - **复权方式**：后复权（hfq）— 历史价格不变，适合增量存储，避免除权导致数据错乱
 - **存储**：本地 SQLite（`data/sequoia_v2.db`），可直接拷贝到其他机器使用
 - **日常增量**：默认最多 2 个进程、小批次隔离、有限退避重试；覆盖率不达标时不发布
-- **邮件安全**：TXT 与已核验数据库分别发送至两个 QQ 邮箱和 `gptway23@gmail.com`；每封发送前查询 SENT，临时失败最多重试一次
+- **邮件安全**：仅保留 TXT 策略报告；不再发送 GPT 数据库附件或历史行情 ZIP；每封发送前查询 SENT，临时失败最多重试一次
 - **创业板支持**：300xxx / 301xxx 自动纳入股票池；涉及涨跌停的策略按 20% 常规限制判断
 
 ---
 
-## 让 GPT 读取完整数据库
+## V10：GPT 按需只读查询 A 股行情
 
-程序会从启用本版本后的每个完整交易日开始，将已核验选股历史写入：
+从 V10 起停止生成 GPT 可下载的全市场 SQLite 快照、停止数据库分片邮件、停止工作流全市场 RAW 回填和 Pages 大规模行情发布。V10 的 `market_api.py` 现在**只包含 BaoStock 单股查询**，不再拥有全市场 SQLite 写入或静态 JSON 导出函数。GPT 仅通过服务器上运行的只读 HTTPS Gateway 请求 BaoStock 历史日K。
 
-- `selection_runs`：市场日期、覆盖率、已执行策略和结果行数。
-- `selection_results`：市场日期、策略名称和股票代码。
-
-GitHub Actions 只有在该市场日期已通过行情门禁时，才会生成
-`sequoia-gpt-database-<market_date>-<run_id>-<run_attempt>` Artifact（保留 7 天）。压缩包包含：
-
-- `sequoia-x-verified.sqlite3`：全部已发布日线行情和完整选股历史。
-- `manifest.json`：数据日期、行数、覆盖率和数据库 SHA-256。
-- `README.txt`：只读查询说明和示例。
-
-`stock_daily_staging` 不会进入快照；订单、资金、持仓、NAV 和任何未知表也不会复制。
-因此同步失败时不会把暂存数据或上一交易日行情标成当日行情。邮件发送失败不会删除已经
-原子保存的选股历史，工作流仍可生成已核验数据库 Artifact，同时保留邮件失败状态。
-
-Artifact 上传后，工作流还会把上述三个白名单文件压缩为 ZIP，并分别发送给固定的三个
-收件人。发送前会再次核对目标日期、完整状态、数据库 SHA-256、SQLite `quick_check` 和
-表白名单，绝不会把原始 `data/sequoia_v2.db` 作为附件。单个附件最多 16 MiB；更大的 ZIP
-会拆成按文件名排序后可二进制拼接的 `.part-001-of-NNN` 分片，默认最多 24 片。每个收件人
-和每个分片都有独立 Message-ID；重跑只补发 Gmail SENT 中缺少的分片。超过分片上限时
-数据库邮件明确失败，但先前上传的 Artifact 仍保留供下载。
-
-数据库邮件正文同时包含纯文本 HTTPS 地址和可点击链接。Artifact 上传成功时直接链接到
-该数据库 Artifact；上传失败时回退到本次 GitHub Actions 运行页面。私有仓库仍需使用有
-权限的 GitHub 账号登录；该链接不会绕过仓库权限，也不会把数据库公开发布。
-
-使用方法：
-
-1. 打开对应的 GitHub Actions 运行页面。
-2. 在 **Artifacts** 下载 `sequoia-gpt-database-...` 并解压。
-3. 将 `sequoia-x-verified.sqlite3` 和 `manifest.json` 一起上传给 GPT。
-4. 先让 GPT 校验 `manifest.json` 的 SHA-256 和 `latest_market_date`，再以 SQLite 只读模式查询。
-
-可以使用以下提示词：
-
-```text
-读取 manifest.json 和 sequoia-x-verified.sqlite3。先校验数据库 SHA-256，报告
-latest_market_date、覆盖率与选股历史的最新日期；随后仅以只读方式查询。
-若请求日期晚于 latest_market_date，明确说明数据尚不可用，不得用旧行情代替。
-```
+- 新建服务：`sequoia_x/gateway/app.py`；复用原 `market_api.fetch_raw()`，返回未复权 OHLCV。
+- GPT 可用接口：GET `/health`、GET `/v1/stocks/{symbol}/daily?start=...&end=...`。
+- 接入：`gpt-action-openapi.yaml`，以 API Key / Bearer 鉴权；完整步骤见 `V10-README-部署与安全说明.md`。
+- 原策略 SQLite `data/sequoia_v2.db` 仍为程序内部必需；GPT 无法通过网关读写它。历史 raw 缓存表手动备份后才可清理。
+- 原 GitHub Pages 静态 API 可能仍在旧部署中公开，停止新的 Pages 发布**不会自动删除历史部署**。如需彻底取消公开访问，在 GitHub 仓库 Settings → Pages 中取消发布旧站点，并按需删除旧历史快照 Artifacts。
 
 ---
 
 ## 许可证 | License
 
 MIT
+
+> 提醒：**V10 只使 GPT 历史日K查询不依赖数据库**。原 `main.py` 策略扫描仍使用本地历史库及完整度检查；独立行情网关不等于全市场策略扫描的完整替代。
