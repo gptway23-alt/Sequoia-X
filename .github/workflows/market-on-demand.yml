@@ -28,6 +28,49 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+
+  deploy:
+    name: Publish Market Data to GitHub Pages
+    needs: query
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout market-data branch
+        uses: actions/checkout@v4
+        with:
+          ref: market-data
+          path: site
+
+      - name: Prepare Pages
+        run: |
+          echo '<!doctype html><html><head><meta charset="utf-8"><title>Sequoia-X Market Data</title></head><body><h1>Sequoia-X Market Data</h1></body></html>' > site/index.html
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Show market data URL
+        run: |
+          echo "### 行情发布成功" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://gptway23-alt.github.io/Sequoia-X/on-demand/${{ inputs.symbol }}/${{ github.run_id }}.json" >> "$GITHUB_STEP_SUMMARY"
+
   query:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
