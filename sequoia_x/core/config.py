@@ -23,7 +23,6 @@ class Settings(BaseSettings):
     gmail_user: str | None = None
     gmail_app_password: str | None = None
     email_report_dir: str = "reports"
-    gpt_export_state_path: str = "reports/gpt-export-state.json"
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -31,30 +30,6 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",  # <--- 加上这一行！让 Pydantic 放行未定义的变量
     )
-
-    @classmethod
-    def settings_customise_sources(cls, settings_cls, **kwargs):  # type: ignore[override]
-        """扩展配置源，支持从环境变量中扫描 STRATEGY_WEBHOOK_ 前缀的键。"""
-        import os
-
-        sources = super().settings_customise_sources(settings_cls, **kwargs)
-
-        # 扫描环境变量，将 STRATEGY_WEBHOOK_<KEY> 收集到 strategy_webhooks
-        prefix = "STRATEGY_WEBHOOK_"
-        webhooks: dict[str, str] = {}
-        for key, value in os.environ.items():
-            if key.upper().startswith(prefix):
-                strategy_key = key[len(prefix):].lower()
-                webhooks[strategy_key] = value
-
-        # 注入到初始化数据中（通过 init_kwargs source）
-        if webhooks:
-            # 直接在 env 层注入，通过 model_post_init 处理
-            os.environ.setdefault("_STRATEGY_WEBHOOKS_PARSED", "1")
-            # 存储解析结果供 model_validator 使用
-            cls._parsed_strategy_webhooks = webhooks
-
-        return sources
 
     def model_post_init(self, __context: object) -> None:
         """初始化后合并 STRATEGY_WEBHOOK_ 前缀的环境变量到 strategy_webhooks。"""

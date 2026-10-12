@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -61,8 +60,6 @@ def _run_with_engine(
     patches = {
         "get_settings": Mock(return_value=SimpleNamespace()),
         "DataEngine": Mock(return_value=engine),
-        "_clear_gpt_export_state": Mock(),
-        "_write_gpt_export_state": Mock(return_value=Path("reports/gpt-export-state.json")),
         "_shanghai_now": Mock(
             return_value=shanghai_now
             or datetime(2026, 10, 8, 19, 15, tzinfo=ZoneInfo("Asia/Shanghai"))
@@ -111,25 +108,16 @@ def test_non_trading_day_skips_strategy_and_email_without_error() -> None:
     strategy = Mock(side_effect=AssertionError("strategy must not be constructed"))
     notifier = Mock(side_effect=AssertionError("email must not be constructed"))
 
-    state_writer = Mock(return_value=Path("reports/gpt-export-state.json"))
     _run_with_engine(
         engine,
         MaVolumeStrategy=strategy,
         EmailNotifier=notifier,
-        _write_gpt_export_state=state_writer,
     )
 
     strategy.assert_not_called()
     notifier.assert_not_called()
     assert engine.pinned is None
     assert engine.recorded is None
-    assert state_writer.call_args.kwargs == {
-        "status": "non_trading_day",
-        "market_date": "2026-10-03",
-        "expected_symbols": 2,
-        "verified_symbols": 0,
-        "coverage": 0.0,
-    }
 
 
 def test_only_verified_strategy_results_reach_one_aggregate_email() -> None:
@@ -175,11 +163,9 @@ def test_only_verified_strategy_results_reach_one_aggregate_email() -> None:
                 report_path=Path("reports/test.txt"),
             )
 
-    state_writer = Mock(return_value=Path("reports/gpt-export-state.json"))
     _run_with_engine(
         engine,
         EmailNotifier=_Notifier,
-        _write_gpt_export_state=state_writer,
         **strategy_types,
     )
 
@@ -194,17 +180,9 @@ def test_only_verified_strategy_results_reach_one_aggregate_email() -> None:
     assert recorded_report is report
     assert recorded_results == captured["strategy_results"]
     assert set(recorded_strategies) == set(strategy_types)
-    assert state_writer.call_args.kwargs == {
-        "status": "complete",
-        "market_date": "2026-10-08",
-        "expected_symbols": 2,
-        "verified_symbols": 1,
-        "coverage": 0.5,
-        "selection_result_rows": 7,
-    }
 
 
-def test_email_failure_happens_after_selection_commit_and_export_state() -> None:
+def test_email_failure_happens_after_selection_commit() -> None:
     report = SyncReport(
         status=SYNC_COMPLETE,
         target_date="2026-10-08",
@@ -234,10 +212,6 @@ def test_email_failure_happens_after_selection_commit_and_export_state() -> None
             },
         )
 
-    def _write_state(*args, **kwargs):
-        events.append("state")
-        return Path("reports/gpt-export-state.json")
-
     class _FailingNotifier:
         def __init__(self, settings):
             pass
@@ -250,20 +224,18 @@ def test_email_failure_happens_after_selection_commit_and_export_state() -> None
         _run_with_engine(
             engine,
             EmailNotifier=_FailingNotifier,
-            _write_gpt_export_state=_write_state,
             **strategy_types,
         )
 
     assert exc_info.value.code == 1
     assert engine.recorded is not None
-    assert events == ["state", "email"]
+    assert events == ["email"]
 
 
 def test_before_shanghai_cutoff_stops_before_engine_and_network() -> None:
     engine_factory = Mock(side_effect=AssertionError("engine must not be constructed"))
     strategy = Mock(side_effect=AssertionError("strategy must not be constructed"))
     notifier = Mock(side_effect=AssertionError("email must not be constructed"))
-    state_writer = Mock(return_value=Path("reports/gpt-export-state.json"))
 
     with (
         patch.object(sys, "argv", ["main.py"]),
@@ -273,8 +245,6 @@ def test_before_shanghai_cutoff_stops_before_engine_and_network() -> None:
                 return_value=SimpleNamespace(daily_sync_not_before="15:30")
             ),
             DataEngine=engine_factory,
-            _clear_gpt_export_state=Mock(),
-            _write_gpt_export_state=state_writer,
             _shanghai_now=Mock(
                 return_value=datetime(
                     2026,
@@ -294,10 +264,6 @@ def test_before_shanghai_cutoff_stops_before_engine_and_network() -> None:
     engine_factory.assert_not_called()
     strategy.assert_not_called()
     notifier.assert_not_called()
-    assert state_writer.call_args.kwargs == {
-        "status": "before_cutoff",
-        "market_date": "2026-10-09",
-    }
 
 
 def test_explicit_past_date_bypasses_today_cutoff() -> None:
@@ -343,50 +309,3 @@ def test_backfill_and_target_date_are_mutually_exclusive() -> None:
         main_module.main()
 
     assert exc_info.value.code == 2
-
-
-def test_gpt_export_state_is_bound_to_current_workflow_attempt(tmp_path, monkeypatch) -> None:
-    state_path = tmp_path / "reports" / "gpt-export-state.json"
-    settings = SimpleNamespace(gpt_export_state_path=str(state_path))
-    monkeypatch.setenv("GITHUB_RUN_ID", "12345")
-    monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
-
-    written = main_module._write_gpt_export_state(
-        settings,
-        status="complete",
-        market_date="2026-10-08",
-        expected_symbols=2,
-        verified_symbols=2,
-        coverage=1.0,
-        selection_result_rows=3,
-    )
-
-    payload = json.loads(state_path.read_text(encoding="utf-8"))
-    assert written == state_path.resolve()
-    assert payload["source_run_id"] == "12345"
-    assert payload["source_run_attempt"] == "2"
-    assert payload["schema_version"] == main_module.GPT_EXPORT_STATE_SCHEMA_VERSION
-    assert payload["market_date"] == "2026-10-08"
-    assert payload["selection_result_rows"] == 3
-    assert not state_path.with_suffix(".json.tmp").exists()
-
-    main_module._clear_gpt_export_state(settings)
-    assert not state_path.exists()
-
-
-def test_gpt_export_state_rejects_non_finite_coverage(tmp_path) -> None:
-    state_path = tmp_path / "reports" / "gpt-export-state.json"
-    settings = SimpleNamespace(gpt_export_state_path=str(state_path))
-
-    with pytest.raises(ValueError, match="Out of range float values"):
-        main_module._write_gpt_export_state(
-            settings,
-            status="complete",
-            market_date="2026-10-08",
-            expected_symbols=2,
-            verified_symbols=2,
-            coverage=float("nan"),
-            selection_result_rows=1,
-        )
-
-    assert not state_path.exists()

@@ -21,56 +21,13 @@ on:
         default: "2026-10-09"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: sequoia-on-demand-publication
+  group: sequoia-on-demand-delivery
   cancel-in-progress: false
 
 jobs:
-
-  deploy:
-    name: Publish Market Data to GitHub Pages
-    needs: query
-    runs-on: ubuntu-24.04
-
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-
-    steps:
-      - name: Checkout market-data branch
-        uses: actions/checkout@v4
-        with:
-          ref: market-data
-          path: site
-
-      - name: Prepare Pages
-        run: |
-          echo '<!doctype html><html><head><meta charset="utf-8"><title>Sequoia-X Market Data</title></head><body><h1>Sequoia-X Market Data</h1></body></html>' > site/index.html
-
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v4
-        with:
-          path: site
-
-      - name: Deploy GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
-
-      - name: Show market data URL
-        run: |
-          echo "### 行情发布成功" >> "$GITHUB_STEP_SUMMARY"
-          echo "https://gptway23-alt.github.io/Sequoia-X/on-demand/${{ inputs.symbol }}/${{ github.run_id }}.json" >> "$GITHUB_STEP_SUMMARY"
-
   query:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -88,6 +45,7 @@ jobs:
         run: python -m pip install 'baostock>=0.9,<1'
 
       - name: Query one symbol without SQLite
+        id: fetch_market_data
         env:
           SYMBOL: ${{ inputs.symbol }}
           START_DATE: ${{ inputs.start_date }}
@@ -117,6 +75,9 @@ jobs:
               end_day = date.fromisoformat(end)
           except ValueError as exc:
               raise SystemExit("Dates must be YYYY-MM-DD") from exc
+
+          if start_day.isoformat() != start or end_day.isoformat() != end:
+              raise SystemExit("Dates must use canonical YYYY-MM-DD format")
 
           if start_day > end_day or (end_day - start_day).days > 400:
               raise SystemExit(
@@ -195,6 +156,8 @@ jobs:
           PY
 
       - name: Deliver market JSON to GPT-readable Gmail
+        id: deliver_email
+        continue-on-error: true
         env:
           SMTP_USER: ${{ secrets.SEQUOIA_SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SEQUOIA_SMTP_PASSWORD }}
@@ -283,6 +246,8 @@ jobs:
           PY
 
       - name: Upload result as artifact
+        id: upload_result
+        if: ${{ !cancelled() && steps.fetch_market_data.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: stock-${{ inputs.symbol }}-${{ github.run_id }}
@@ -290,45 +255,23 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Publish to market-data branch
+      - name: Preserve final delivery status
+        if: ${{ !cancelled() }}
         env:
-          SYMBOL: ${{ inputs.symbol }}
+          QUERY_OUTCOME: ${{ steps.fetch_market_data.outcome }}
+          EMAIL_OUTCOME: ${{ steps.deliver_email.outcome }}
+          ARTIFACT_OUTCOME: ${{ steps.upload_result.outcome }}
         shell: bash
         run: |
-          set -euo pipefail
-
-          git config user.name "github-actions[bot]"
-          git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
-
-          if git ls-remote --exit-code \
-              --heads origin market-data >/dev/null; then
-
-            git fetch --depth=1 origin market-data
-            git checkout -B market-data FETCH_HEAD
-
-          else
-            git checkout --orphan market-data
-            git rm -rf . >/dev/null 2>&1 || true
+          if [ "$QUERY_OUTCOME" != "success" ]; then
+            echo "::error::按需行情查询失败: $QUERY_OUTCOME"
+            exit 1
           fi
-
-          target="on-demand/${SYMBOL}/${GITHUB_RUN_ID}.json"
-
-          mkdir -p "$(dirname "$target")"
-          cp "$RUNNER_TEMP/market-data.json" "$target"
-
-          git add -- "$target"
-          git commit -m "data: ${SYMBOL} run ${GITHUB_RUN_ID}"
-          git push origin HEAD:refs/heads/market-data
-
-          url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/market-data/${target}"
-
-          {
-            echo "### 按需行情已发布"
-            echo
-            echo "$target"
-            echo
-            echo "$url"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          printf 'Result URL: %s\n' "$url"
+          if [ "$EMAIL_OUTCOME" != "success" ]; then
+            echo "::error::行情文件已作为 Artifact 保存（如上传成功），但邮件发送失败: $EMAIL_OUTCOME"
+            exit 1
+          fi
+          if [ "$ARTIFACT_OUTCOME" != "success" ]; then
+            echo "::error::行情 Artifact 保存失败: $ARTIFACT_OUTCOME"
+            exit 1
+          fi

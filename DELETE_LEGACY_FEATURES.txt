@@ -4,8 +4,10 @@ sequoia_x/data/gpt_export.py
 sequoia_x/notify/database_email.py
 tests/test_gpt_export.py
 tests/test_database_email.py
+scripts/scripts/check_db_duplicates.py
 
 The full ZIP omits those files. Manual overlay onto existing files does NOT delete old files automatically.
+The duplicate database audit script now lives at scripts/check_db_duplicates.py.
 
 NEVER DELETE: data/sequoia_v2.db or other original strategy/trading databases, sequoia_x/data/engine.py, signal history, or live/paper trading ledgers.
 Only consider removing stock_daily_raw + stock_daily_raw_sync via scripts/cleanup_unused_raw_tables.py AFTER recovery backup and verification.

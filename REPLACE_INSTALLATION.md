@@ -13,6 +13,7 @@
    - `sequoia_x/notify/database_email.py`
    - `tests/test_gpt_export.py`
    - `tests/test_database_email.py`
+   - `scripts/scripts/check_db_duplicates.py` (the audit script is now at `scripts/check_db_duplicates.py`)
 4. 查看 `git status` 和 `git diff`，确保真实 SQLite / `.env` 未被删除或提交。
 5. 运行 `python -m pytest -q`（开发依赖完整安装时）。
 6. 提交、推送到 `master`；部署 HTTPS 网关并配置 GPT 接口密钥和 `gpt-action-openapi.yaml`。

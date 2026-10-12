@@ -78,161 +78,7 @@ jobs:
         id: db_audit
         if: ${{ steps.require_db.outcome == 'success' }}
         continue-on-error: true
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os
-          import sqlite3
-          from pathlib import Path
-
-          path = Path(os.environ['DB_PATH']).resolve()
-          conn = sqlite3.connect(
-              path.as_uri() + '?mode=ro',
-              uri=True,
-              timeout=30
-          )
-          try:
-              result = conn.execute(
-                  'PRAGMA quick_check'
-              ).fetchone()[0]
-
-              if result != 'ok':
-                  raise SystemExit(
-                      f'SQLite quick_check 失败：{result}'
-                  )
-
-              tables = {
-                  row[0] for row in conn.execute(
-                      "SELECT name FROM sqlite_master "
-                      "WHERE type='table'"
-                  )
-              }
-
-              print(f'数据库文件：{path}')
-              print(
-                  f'文件大小：'
-                  f'{path.stat().st_size / 1024**2:.2f} MiB'
-              )
-              print('SQLite quick_check: ok')
-
-              report = [
-                  '## Sequoia-X 数据库只读审计',
-                  f'- 数据库大小：'
-                  f'{path.stat().st_size / 1024**2:.2f} MiB',
-              ]
-
-              for table in (
-                  'stock_daily',
-                  'stock_daily_raw'
-              ):
-                  if table not in tables:
-                      print(
-                          f'{table}: 不存在（已跳过）'
-                      )
-                      report.append(
-                          f'- `{table}`：不存在'
-                      )
-                      if table == 'stock_daily':
-                          raise SystemExit(
-                              '缺少策略必需的 stock_daily 表'
-                          )
-                      continue
-
-                  columns = {
-                      row[1] for row in conn.execute(
-                          f'PRAGMA table_info("{table}")'
-                      )
-                  }
-
-                  if not {'symbol', 'date'} <= columns:
-                      raise SystemExit(
-                          f'{table} 缺少 symbol/date 列：'
-                          f'{columns}'
-                      )
-
-                  total = conn.execute(
-                      f'SELECT COUNT(*) FROM "{table}"'
-                  ).fetchone()[0]
-
-                  groups, extra = conn.execute(f'''
-                      SELECT
-                          COUNT(*),
-                          COALESCE(SUM(n - 1), 0)
-                      FROM (
-                          SELECT COUNT(*) AS n
-                          FROM "{table}"
-                          GROUP BY symbol, date
-                          HAVING COUNT(*) > 1
-                      )
-                  ''').fetchone()
-
-                  print(
-                      f'{table}: '
-                      f'总记录={total:,}, '
-                      f'重复组合={groups:,}, '
-                      f'多余记录={extra:,}'
-                  )
-
-                  report.append(
-                      f'- `{table}`：'
-                      f'总记录 {total:,}；'
-                      f'重复组合 {groups:,}；'
-                      f'多余记录 {extra:,}'
-                  )
-
-                  if groups:
-                      print(
-                          f'::warning::{table} 发现 '
-                          f'{groups} 组重复股票日期，'
-                          f'请人工核查；未删除数据'
-                      )
-
-              page_size = conn.execute(
-                  'PRAGMA page_size'
-              ).fetchone()[0]
-
-              page_count = conn.execute(
-                  'PRAGMA page_count'
-              ).fetchone()[0]
-
-              free_count = conn.execute(
-                  'PRAGMA freelist_count'
-              ).fetchone()[0]
-
-              free_mib = (
-                  page_size * free_count / 1024**2
-              )
-
-              print(
-                  f'SQLite 空闲可复用页：'
-                  f'{free_mib:.2f} MiB'
-              )
-
-              report.append(
-                  f'- SQLite 空闲可复用页：'
-                  f'{free_mib:.2f} MiB'
-              )
-
-              report.append(
-                  '- 本次只读检查，未删除或修改数据库。'
-              )
-
-              summary = os.environ.get(
-                  'GITHUB_STEP_SUMMARY'
-              )
-
-              if summary:
-                  with open(
-                      summary,
-                      'a',
-                      encoding='utf-8'
-                  ) as f:
-                      f.write(
-                          '\n'.join(report) + '\n'
-                      )
-          finally:
-              conn.close()
-          PY
+        run: python scripts/check_db_duplicates.py
 
       - name: Set up uv
         if: ${{ env.DAILY_MODE == 'true' && steps.db_audit.outcome == 'success' }}
@@ -257,15 +103,13 @@ jobs:
         if: ${{ env.DAILY_MODE == 'true' && steps.db_audit.outcome == 'success' }}
         continue-on-error: true
         run: |
-          python -m pytest -q \
-            --ignore=tests/test_database_email.py \
-            --ignore=tests/test_gpt_export.py
+          python -m pytest -q
 
       - name: Run Sequoia-X
         id: run_sequoia
         if: ${{ env.DAILY_MODE == 'true' && steps.offline_tests.outcome == 'success' }}
         continue-on-error: true
-        timeout-minutes: 60
+        timeout-minutes: 150
         env:
           TARGET_DATE: ${{ inputs.target_date }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}

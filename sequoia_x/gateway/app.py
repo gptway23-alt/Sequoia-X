@@ -17,7 +17,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query
 from fastapi.concurrency import run_in_threadpool
 
-from sequoia_x.data.market_api import MarketApiError, fetch_raw
+from sequoia_x.data.market_api import fetch_raw
 
 logger = logging.getLogger(__name__)
 app = FastAPI(
@@ -61,7 +61,7 @@ def _query_raw(symbol: str, start: str, end: str) -> list[tuple]:
                 _session_connected = True
             try:
                 return fetch_raw(bs, symbol, start, end)
-            except (MarketApiError, OSError, ConnectionError) as exc:
+            except Exception as exc:
                 logger.warning("BaoStock query failed for %s (attempt %s): %s", symbol, attempt + 1, exc)
                 try:
                     bs.logout()

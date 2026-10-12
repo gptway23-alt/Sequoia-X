@@ -126,7 +126,7 @@ Sequoia-X/
 - **复权方式**：后复权（hfq）— 历史价格不变，适合增量存储，避免除权导致数据错乱
 - **存储**：本地 SQLite（`data/sequoia_v2.db`），可直接拷贝到其他机器使用
 - **日常增量**：默认最多 2 个进程、小批次隔离、有限退避重试；覆盖率不达标时不发布
-- **邮件安全**：仅保留 TXT 策略报告；不再发送 GPT 数据库附件或历史行情 ZIP；每封发送前查询 SENT，临时失败最多重试一次
+- **邮件安全**：每日主流程只发送 TXT 策略报告；手动按需流程只发送单只股票的历史行情 JSON，不发送数据库附件或全市场历史 ZIP。TXT 邮件发送前查询 Gmail SENT，临时失败最多重试一次
 - **创业板支持**：300xxx / 301xxx 自动纳入股票池；涉及涨跌停的策略按 20% 常规限制判断
 
 ---
@@ -138,8 +138,9 @@ Sequoia-X/
 - 新建服务：`sequoia_x/gateway/app.py`；复用原 `market_api.fetch_raw()`，返回未复权 OHLCV。
 - GPT 可用接口：GET `/health`、GET `/v1/stocks/{symbol}/daily?start=...&end=...`。
 - 接入：`gpt-action-openapi.yaml`，以 API Key / Bearer 鉴权；完整步骤见 `V10-README-部署与安全说明.md`。
+- 手动按需邮件：GitHub Actions 的 `Sequoia-X On-demand BaoStock` 只把单只股票的查询结果发送到 `gptway23@gmail.com` 并保存为短期 Artifact；不再向 Pages 或公开分支发布行情文件。
 - 原策略 SQLite `data/sequoia_v2.db` 仍为程序内部必需；GPT 无法通过网关读写它。历史 raw 缓存表手动备份后才可清理。
-- 原 GitHub Pages 静态 API 可能仍在旧部署中公开，停止新的 Pages 发布**不会自动删除历史部署**。如需彻底取消公开访问，在 GitHub 仓库 Settings → Pages 中取消发布旧站点，并按需删除旧历史快照 Artifacts。
+- 旧 GitHub Pages 静态 API 可能仍在旧部署中公开；本版本不再部署 Pages。若要取消旧站点公开访问，需在 GitHub 仓库 Settings → Pages 中单独取消发布并检查旧 URL。
 
 ---
 
