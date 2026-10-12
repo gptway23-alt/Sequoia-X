@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import atexit
+import json
 import math
 import socket
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Iterable, Iterator
 
 import pandas as pd
@@ -71,6 +73,33 @@ ON CONFLICT(target_date, symbol, date) DO UPDATE SET
     volume = excluded.volume,
     turnover = excluded.turnover
 """
+
+# 研究信号历史只记录已发布行情对应的策略输出；不包含模拟交易账本。
+_CREATE_SELECTION_RUNS_SQL = """
+CREATE TABLE IF NOT EXISTS selection_runs (
+    selection_date TEXT NOT NULL PRIMARY KEY,
+    target_date TEXT NOT NULL,
+    status TEXT NOT NULL,
+    executed_strategies TEXT NOT NULL,
+    strategy_count INTEGER NOT NULL,
+    result_count INTEGER NOT NULL,
+    recorded_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+_CREATE_SELECTION_RESULTS_SQL = """
+CREATE TABLE IF NOT EXISTS selection_results (
+    selection_date TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    strategies TEXT NOT NULL,
+    strategy_hit_count INTEGER NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (selection_date, symbol),
+    FOREIGN KEY (selection_date) REFERENCES selection_runs(selection_date)
+);
+"""
+
 
 _UPSERT_SQL = """
 INSERT INTO stock_daily
@@ -367,6 +396,8 @@ class DataEngine:
             conn.execute(_CREATE_TABLE_SQL)
             conn.execute(_CREATE_INDEX_SQL)
             conn.execute(_CREATE_STAGING_SQL)
+            conn.execute(_CREATE_SELECTION_RUNS_SQL)
+            conn.execute(_CREATE_SELECTION_RESULTS_SQL)
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
@@ -668,14 +699,35 @@ class DataEngine:
                     conn.rollback()
                 raise
 
-    def _stage_rows(self, target_date: str, rows: list[tuple]) -> None:
-        """持久化经过格式核验的部分结果；不影响正式股票日线表。"""
+    def _stage_rows(
+        self,
+        target_date: str | list[tuple],
+        rows: list[tuple] | str,
+    ) -> None:
+        """持久化暂存；兼容历史调用 _stage_rows(rows, target_date)。
+
+        暂存记录绝不出现在正式发布集合 verified_symbols 中；
+        直到通过 min_daily_coverage 门禁后才允许迁移至 stock_daily。
+        """
+        if not isinstance(target_date, str) and isinstance(rows, str):
+            target_date, rows = rows, target_date
+        if not isinstance(target_date, str) or isinstance(rows, str):
+            raise TypeError("_stage_rows 需要交易日字符串与行情行序列")
+        date.fromisoformat(target_date)
         if not rows:
             return
+        validated_rows: list[tuple] = []
+        for row in rows:
+            if len(row) != 8:
+                raise DataIntegrityError("暂存行情必须包含 symbol/date/OHLC/volume/turnover 共8列")
+            row_date = date.fromisoformat(str(row[1]))
+            if row_date > date.fromisoformat(target_date):
+                raise DataIntegrityError("暂存行情日期晚于目标交易日")
+            validated_rows.append(tuple(row))
         with sqlite3.connect(self.db_path) as conn:
             conn.executemany(
                 _STAGE_UPSERT_SQL,
-                [(target_date, *row) for row in rows],
+                [(target_date, *row) for row in validated_rows],
             )
             # 每个短事务由 SQLite 保证原子性；全库 quick_check 放到备份/发布阶段，
             # 避免数百个批次重复全库扫描。
@@ -843,6 +895,13 @@ class DataEngine:
                 expected_symbols=len(expected),
                 verified_symbols=frozenset(verified_before),
                 stale_symbols=frozenset(expected - verified_before),
+            )
+
+        # 仅保留本目标日期的待发布快照；严格禁止跨交易日复用陈旧暂存。
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "DELETE FROM stock_daily_staging WHERE target_date < ?",
+                (target_text,),
             )
 
         verified_before = self._get_verified_symbols(target_text) & expected
@@ -1109,6 +1168,133 @@ class DataEngine:
             f"失败: {len(report.failed_symbols)}"
         )
         return report
+
+    def record_verified_selections(
+        self,
+        sync_report: SyncReport,
+        strategy_results: dict[str, Iterable[str]],
+        executed_strategies: Iterable[str],
+    ) -> int:
+        """按完整信号日原子替换已核验的研究选股历史。
+
+        只接收 SYNC_COMPLETE、已发布且当日价格核验的策略结果；
+        对相同日期的完全一致重跑，保留首次 recorded_at。
+        与订单、流水、持仓、NAV 无关。
+        """
+        if sync_report.status != SYNC_COMPLETE or not sync_report.is_trade_day:
+            raise DataIntegrityError("只能记录完整交易日、已发布行情对应的研究选股")
+        try:
+            date.fromisoformat(sync_report.target_date)
+        except (TypeError, ValueError) as exc:
+            raise DataIntegrityError("研究选股日期非法") from exc
+        if (
+            sync_report.expected_symbols <= 0
+            or sync_report.coverage < self.min_daily_coverage
+        ):
+            raise DataIntegrityError("只能记录已通过完整性覆盖率门禁的研究选股")
+
+        strategies = sorted({str(x).strip() for x in executed_strategies})
+        if any(not name for name in strategies):
+            raise DataIntegrityError("执行策略名称为空")
+        if not isinstance(strategy_results, dict):
+            raise TypeError("strategy_results 应为 strategy -> symbols 的字典")
+
+        selected: dict[str, set[str]] = {}
+        for strategy, symbols in strategy_results.items():
+            if strategy not in strategies:
+                raise DataIntegrityError(f"结果包含未执行的策略: {strategy!r}")
+            for original in symbols:
+                symbol = str(original).strip().zfill(6)
+                if len(symbol) != 6 or not symbol.isdigit():
+                    raise DataIntegrityError(f"选股代码不合法: {original!r}")
+                if symbol not in sync_report.verified_symbols:
+                    raise DataIntegrityError(f"缺少同日有效已发布行情: {symbol}")
+                selected.setdefault(symbol, set()).add(strategy)
+
+        now = datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")
+        report_date = sync_report.target_date
+        with sqlite3.connect(self.db_path) as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                # 必须在同一事务里验证真实同日价，不能只信任报告的字符串集合。
+                published = (
+                    self._get_verified_symbols_from_connection(conn, report_date)
+                    & set(selected)
+                )
+                missing = set(selected) - published
+                if missing:
+                    raise DataIntegrityError(
+                        "缺少同日有效已发布行情: " + ",".join(sorted(missing))
+                    )
+
+                current = conn.execute(
+                    "SELECT executed_strategies, result_count, recorded_at "
+                    "FROM selection_runs WHERE selection_date = ?",
+                    (report_date,),
+                ).fetchone()
+                existing_results = {
+                    symbol: tuple(json.loads(names))
+                    for symbol, names in conn.execute(
+                        "SELECT symbol, strategies FROM selection_results "
+                        "WHERE selection_date = ?",
+                        (report_date,),
+                    ).fetchall()
+                }
+                target_results = {
+                    symbol: tuple(sorted(names))
+                    for symbol, names in selected.items()
+                }
+                exact_rerun = bool(
+                    current
+                    and json.loads(current[0]) == strategies
+                    and existing_results == target_results
+                )
+                if exact_rerun:
+                    conn.rollback()  # 幂等重跑不改变首次登记时间
+                    return len(target_results)
+
+                # 在单一事务中替换同一信号日；任何错误都回滚。
+                conn.execute(
+                    """INSERT INTO selection_runs
+                       (selection_date, target_date, status, executed_strategies,
+                        strategy_count, result_count, recorded_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(selection_date) DO UPDATE SET
+                         target_date=excluded.target_date,
+                         status=excluded.status,
+                         executed_strategies=excluded.executed_strategies,
+                         strategy_count=excluded.strategy_count,
+                         result_count=excluded.result_count,
+                         updated_at=excluded.updated_at""",
+                    (
+                        report_date, report_date, sync_report.status,
+                        json.dumps(strategies, ensure_ascii=False), len(strategies),
+                        len(target_results), now, now,
+                    ),
+                )
+                conn.execute(
+                    "DELETE FROM selection_results WHERE selection_date = ?",
+                    (report_date,),
+                )
+                conn.executemany(
+                    """INSERT INTO selection_results
+                       (selection_date, symbol, strategies, strategy_hit_count, recorded_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    [
+                        (
+                            report_date, symbol,
+                            json.dumps(names, ensure_ascii=False),
+                            len(names), now,
+                        )
+                        for symbol, names in sorted(target_results.items())
+                    ],
+                )
+                conn.commit()
+                return len(target_results)
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
 
     def get_all_symbols(self) -> list[str]:
         """获取全市场 A 股代码；远端失败与合法空结果严格区分。"""
