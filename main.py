@@ -8,6 +8,8 @@
 import argparse
 import socket
 import sys
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -33,6 +35,17 @@ SUPPORTED_PREFIXES = (
     "300", "301",                    # 创业板
     "600", "601", "603", "605",      # 沪市主板
 )
+
+
+def _after_market_close(now: datetime | None = None) -> bool:
+    """Only run daily stock selection after the Shanghai market has closed."""
+    shanghai = ZoneInfo("Asia/Shanghai")
+    current = now or datetime.now(shanghai)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=shanghai)
+    else:
+        current = current.astimezone(shanghai)
+    return current.weekday() < 5 and current.time() >= time(15, 5)
 
 
 def main() -> None:
@@ -80,6 +93,14 @@ def main() -> None:
             logger.info("Sequoia-X V2 回填模式运行完成")
             return
 
+        if not _after_market_close():
+            logger.info("当前不在上海时间工作日 15:05 后的运行时段，跳过行情同步和选股")
+            return
+
+        if not engine.is_trading_day():
+            logger.info("今日不是 A 股交易日，跳过行情同步和选股")
+            return
+
         # 4. 日常模式：检查并补齐股票池
         logger.info("检查本地股票池完整性...")
 
@@ -121,9 +142,9 @@ def main() -> None:
             logger.info("本地股票池已完整，无需补齐")
 
         # 5. 增量同步
-        logger.info("开始拉取最新快照...")
-        count = engine.sync_today_bulk()
-        logger.info(f"快照同步完成，写入 {count} 只股票")
+        logger.info("开始刷新当日收盘日线...")
+        count = engine.sync_today_bulk(expected_symbols=all_symbols)
+        logger.info(f"行情校验完成，写入 {count} 条日线记录")
 
         # 6. 策略列表
         strategies: list[BaseStrategy] = [
@@ -146,6 +167,17 @@ def main() -> None:
 
             selected: list[str] = strategy.run()
 
+            verified_symbols = getattr(engine, "verified_symbols", None)
+            if verified_symbols is not None:
+                before_filter = len(selected)
+                selected = [symbol for symbol in selected if symbol in verified_symbols]
+                if len(selected) < before_filter:
+                    logger.warning(
+                        "%s 移除 %d 只当日行情未核验股票",
+                        strategy_name,
+                        before_filter - len(selected),
+                    )
+
             logger.info(
                 f"{strategy_name} 选出 {len(selected)} 只股票"
             )
@@ -155,6 +187,7 @@ def main() -> None:
                     symbols=selected,
                     strategy_name=strategy_name,
                     webhook_key=strategy.webhook_key,
+                    verified_symbols=verified_symbols,
                 )
                 if not sent:
                     notification_failures.append(strategy_name)

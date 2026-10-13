@@ -1,7 +1,9 @@
 """主程序入口属性测试。"""
 
 import sys
+from datetime import datetime
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from hypothesis import given, settings as h_settings
@@ -9,6 +11,13 @@ from hypothesis import strategies as st
 
 # 预先导入 main 模块，避免在 @given 循环中重复导入
 import main as main_module
+
+
+def test_market_data_run_waits_until_after_close() -> None:
+    shanghai = ZoneInfo("Asia/Shanghai")
+    assert not main_module._after_market_close(datetime(2026, 10, 13, 14, 59, tzinfo=shanghai))
+    assert main_module._after_market_close(datetime(2026, 10, 13, 15, 5, tzinfo=shanghai))
+    assert not main_module._after_market_close(datetime(2026, 10, 17, 19, 15, tzinfo=shanghai))
 
 
 # Feature: sequoia-x-v2, Property 13: 主程序异常以非零退出码终止
@@ -29,7 +38,7 @@ def test_email_failure_does_not_stop_later_strategies(monkeypatch) -> None:
 
     class FakeEngine:
         def __init__(self, settings) -> None:
-            pass
+            self.verified_symbols = {"000001"}
 
         def get_all_symbols(self) -> list[str]:
             return ["000001"]
@@ -37,7 +46,10 @@ def test_email_failure_does_not_stop_later_strategies(monkeypatch) -> None:
         def get_local_symbols(self) -> list[str]:
             return ["000001"]
 
-        def sync_today_bulk(self) -> int:
+        def is_trading_day(self) -> bool:
+            return True
+
+        def sync_today_bulk(self, expected_symbols: list[str] | None = None) -> int:
             return 1
 
     strategy_runs: list[str] = []
@@ -50,13 +62,14 @@ def test_email_failure_does_not_stop_later_strategies(monkeypatch) -> None:
 
         def run(self) -> list[str]:
             strategy_runs.append("run")
-            return ["000001"]
+            return ["000001", "000002"]
 
     notifier = MagicMock()
     notifier.send.side_effect = [False, True, True, True, True, True, True]
 
     with (
         patch.object(main_module, "get_settings", return_value=object()),
+        patch.object(main_module, "_after_market_close", return_value=True),
         patch.object(main_module, "DataEngine", FakeEngine),
         patch.object(main_module, "EmailNotifier", return_value=notifier),
         patch.object(main_module, "MaVolumeStrategy", FakeStrategy),
@@ -73,3 +86,8 @@ def test_email_failure_does_not_stop_later_strategies(monkeypatch) -> None:
     assert exc_info.value.code == 2
     assert len(strategy_runs) == 7
     assert notifier.send.call_count == 7
+    assert all(
+        call.kwargs["symbols"] == ["000001"]
+        and call.kwargs["verified_symbols"] == {"000001"}
+        for call in notifier.send.call_args_list
+    )

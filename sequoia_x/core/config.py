@@ -1,5 +1,6 @@
 """配置管理模块：通过 pydantic-settings 从环境变量或 .env 文件加载系统配置。"""
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -8,6 +9,11 @@ class Settings(BaseSettings):
     start_date: str = "2024-01-01"
     feishu_webhook_url: str | None = None
     strategy_webhooks: dict[str, str] = {}
+    baostock_max_workers: int = Field(default=2, ge=1, le=4)
+    baostock_batch_size: int = Field(default=100, ge=10, le=500)
+    baostock_max_attempts: int = Field(default=3, ge=1, le=5)
+    baostock_backoff_seconds: float = Field(default=1.0, ge=0, le=60)
+    min_market_data_coverage: float = Field(default=0.98, gt=0, le=1)
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -1,7 +1,11 @@
 """数据引擎模块：负责 SQLite 行情数据存储与 baostock 增量同步。"""
 
 import sqlite3
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -31,34 +35,101 @@ CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
 
-def _bs_fetch_batch(tasks: list) -> list:
-    """多进程 worker：独立 login，批量拉取 baostock 数据。"""
+class DataIntegrityError(RuntimeError):
+    """Raised when current-day market data is incomplete or cannot be verified."""
+
+
+@dataclass
+class BatchResult:
+    rows: list[list[str]]
+    failed_symbols: list[str]
+    errors: list[str]
+
+
+def _bs_fetch_batch(payload: tuple) -> BatchResult:
+    """Fetch one isolated BaoStock batch, reconnecting and retrying boundedly."""
+    tasks, max_attempts, backoff_seconds = payload
+    import time
+
     import baostock as bs
-    bs.login()
-    results = []
-    for symbol, bs_code, start, end in tasks:
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            "date,open,high,low,close,volume,amount",
-            start_date=start,
-            end_date=end,
-            frequency="d",
-            adjustflag="1",  # 后复权
-        )
-        if rs.error_code != "0":
-            continue
-        while rs.next():
-            results.append([symbol] + rs.get_row_data())
-    bs.logout()
-    return results
+
+    rows: list[list[str]] = []
+    failed: list[str] = []
+    errors: list[str] = []
+
+    def login() -> bool:
+        result = bs.login()
+        if result.error_code != "0":
+            errors.append(f"login: {result.error_msg}")
+            return False
+        return True
+
+    if not login():
+        return BatchResult(rows, [task[0] for task in tasks], errors)
+
+    try:
+        consecutive_failures = 0
+        for index, (symbol, bs_code, start, end) in enumerate(tasks):
+            for attempt in range(max_attempts):
+                try:
+                    result = bs.query_history_k_data_plus(
+                        bs_code,
+                        "date,open,high,low,close,volume,amount",
+                        start_date=start,
+                        end_date=end,
+                        frequency="d",
+                        adjustflag="1",  # 后复权
+                    )
+                    if result.error_code != "0":
+                        raise RuntimeError(result.error_msg)
+
+                    symbol_rows: list[list[str]] = []
+                    while result.next():
+                        row = result.get_row_data()
+                        if len(row) != 7:
+                            raise ValueError(f"unexpected BaoStock row width: {len(row)}")
+                        symbol_rows.append([symbol] + row)
+                    rows.extend(symbol_rows)
+                    consecutive_failures = 0
+                    break
+                except Exception as exc:
+                    if attempt + 1 >= max_attempts:
+                        failed.append(symbol)
+                        errors.append(f"{symbol}: {exc}")
+                        consecutive_failures += 1
+                        if consecutive_failures >= 5:
+                            failed.extend(task[0] for task in tasks[index + 1 :])
+                            errors.append("batch stopped after 5 consecutive query failures")
+                            return BatchResult(rows, failed, errors)
+                        break
+
+                    try:
+                        bs.logout()
+                    except Exception:
+                        pass
+                    time.sleep(backoff_seconds * (2**attempt))
+                    if not login():
+                        failed.append(symbol)
+                        failed.extend(task[0] for task in tasks[index + 1 :])
+                        return BatchResult(rows, failed, errors)
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
+
+    return BatchResult(rows, failed, errors)
 
 
 class DataEngine:
     """行情数据引擎，负责 SQLite 存储和 baostock 数据同步。"""
 
     def __init__(self, settings: Settings) -> None:
+        self.settings = settings
         self.db_path: str = settings.db_path
         self.start_date: str = settings.start_date
+        self.verified_symbols: set[str] | None = None
+        self.verified_date: str | None = None
         self._init_db()
 
     def _init_db(self) -> None:
@@ -78,6 +149,20 @@ class DataEngine:
         return row[0] if row and row[0] else None
 
     def get_ohlcv(self, symbol: str) -> pd.DataFrame:
+        if self.verified_symbols is not None and symbol not in self.verified_symbols:
+            return pd.DataFrame(
+                columns=[
+                    "id",
+                    "symbol",
+                    "date",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "turnover",
+                ]
+            )
         with sqlite3.connect(self.db_path) as conn:
             df = pd.read_sql(
                 "SELECT * FROM stock_daily WHERE symbol = ? ORDER BY date",
@@ -94,66 +179,181 @@ class DataEngine:
 
     # ── 数据同步 ──
 
-    def sync_today_bulk(self) -> int:
-        """多进程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。"""
-        from datetime import date, timedelta
-        from multiprocessing import Pool
+    def sync_today_bulk(
+        self,
+        expected_symbols: list[str] | None = None,
+        target_date: date | None = None,
+    ) -> int:
+        """Refresh current-day rows and publish only after full-batch validation."""
+        today = target_date or datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        today_str = today.isoformat()
 
-        today_str = date.today().strftime("%Y-%m-%d")
-
-        tasks = []
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
                 "SELECT symbol, MAX(date) FROM stock_daily GROUP BY symbol"
             ).fetchall()
 
-        if not rows:
-            logger.warning("本地无股票数据，请先执行 --backfill")
-            return 0
+        last_dates = {symbol: last_date for symbol, last_date in rows}
+        symbols = sorted(set(expected_symbols) if expected_symbols is not None else last_dates)
+        if not symbols:
+            raise DataIntegrityError("股票池为空，停止行情同步")
 
-        for symbol, last_date in rows:
-            if last_date and last_date >= today_str:
-                continue
-            start = today_str
-            if last_date:
-                start = (date.fromisoformat(last_date) + timedelta(days=1)).strftime("%Y-%m-%d")
+        tasks = []
+        for symbol in symbols:
+            last_date = last_dates.get(symbol)
+            if last_date and last_date < today_str:
+                start = (date.fromisoformat(last_date) + timedelta(days=1)).isoformat()
+            else:
+                # Refresh today's records even if a previous run saved an
+                # intraday/incomplete bar before market close.
+                start = today_str
             tasks.append((symbol, self._to_baostock_code(symbol), start, today_str))
 
-        if not tasks:
-            logger.info("所有股票已是最新，无需更新")
-            return 0
+        expected_count = len(symbols)
+        batch_size = self.settings.baostock_batch_size
+        batches = [tasks[i : i + batch_size] for i in range(0, len(tasks), batch_size)]
+        payloads = [
+            (batch, self.settings.baostock_max_attempts, self.settings.baostock_backoff_seconds)
+            for batch in batches
+        ]
 
-        logger.info(f"需要更新 {len(tasks)} 只股票，启动多进程并行拉取...")
+        logger.info(
+            "刷新 %d 只股票的 %s 日行情；批次=%d，并发上限=%d，单股最多尝试=%d 次",
+            len(tasks),
+            today_str,
+            len(batches),
+            min(self.settings.baostock_max_workers, len(batches)),
+            self.settings.baostock_max_attempts,
+        )
 
-        n_workers = min(8, len(tasks))
-        chunks = [tasks[i::n_workers] for i in range(n_workers)]
+        results: list[BatchResult] = []
+        failed_symbols: set[str] = set()
+        batch_errors: list[str] = []
+        failed_batches = 0
+        max_workers = min(self.settings.baostock_max_workers, len(batches))
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_batches = {
+                executor.submit(_bs_fetch_batch, payload): batch
+                for payload, batch in zip(payloads, batches)
+            }
 
-        with Pool(n_workers) as pool:
-            batch_results = pool.map(_bs_fetch_batch, chunks)
+            def cancel_queued_batches() -> None:
+                for pending, pending_batch in future_batches.items():
+                    if pending.cancel():
+                        failed_symbols.update(task[0] for task in pending_batch)
 
-        all_rows = []
-        for batch in batch_results:
-            all_rows.extend(batch)
+            for future in as_completed(future_batches):
+                batch = future_batches[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    failed_symbols.update(task[0] for task in batch)
+                    batch_errors.append(str(exc))
+                    if not future.cancelled():
+                        failed_batches += 1
+                        if failed_batches >= max_workers:
+                            logger.error("多个行情批次全部失败，取消尚未开始的批次")
+                            cancel_queued_batches()
+                    continue
+                results.append(result)
+                failed_symbols.update(result.failed_symbols)
+                batch_errors.extend(result.errors[:3])
+                if len(result.failed_symbols) == len(batch):
+                    failed_batches += 1
+                    if failed_batches >= max_workers:
+                        logger.error("多个行情批次全部失败，取消尚未开始的批次")
+                        cancel_queued_batches()
 
-        if not all_rows:
-            logger.info("无新数据（可能非交易日）")
-            return 0
+        all_rows = [row for result in results for row in result.rows]
+        df = pd.DataFrame(
+            all_rows,
+            columns=["symbol", "date", "open", "high", "low", "close", "volume", "turnover"],
+        )
+        if not df.empty:
+            for col in ["open", "high", "low", "close", "volume", "turnover"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["date"] = df["date"].astype(str)
+            df = df.dropna(subset=["close", "volume"])
+            df = df[(df["close"] > 0) & (df["volume"] > 0) & (df["date"] <= today_str)]
+            df = df.drop_duplicates(subset=["symbol", "date"], keep="last")
 
-        df = pd.DataFrame(all_rows, columns=["symbol", "date", "open", "high", "low", "close", "volume", "turnover"])
-        for col in ["open", "high", "low", "close", "volume", "turnover"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["close"])
-        df = df[df["volume"] > 0]
+        received_current = (
+            set(df.loc[df["date"] == today_str, "symbol"].astype(str))
+            if not df.empty
+            else set()
+        )
+        # Validate only rows returned by this run. Cached today's rows are not
+        # trusted because an earlier workflow may have run before market close.
+        coverage = len(received_current) / expected_count
+        minimum = self.settings.min_market_data_coverage
+        if coverage < minimum:
+            error_summary = "; ".join(batch_errors[:5])
+            logger.error(
+                "%s 行情覆盖率 %.2f%% 低于门槛 %.2f%%；失败股票=%d/%d；本轮数据不发布",
+                today_str,
+                coverage * 100,
+                minimum * 100,
+                len(failed_symbols),
+                expected_count,
+            )
+            raise DataIntegrityError(
+                f"{today_str} 行情覆盖率 {coverage:.2%} 低于门槛 {minimum:.2%}；"
+                f"失败股票={len(failed_symbols)}；{error_summary}"
+            )
 
-        count = len(df)
+        # Atomic publication: replace only after validation. Never delete an
+        # entire date and then leave it with a partial set of symbols.
+        columns = ["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]
+        values = [
+            tuple(None if pd.isna(value) else value for value in row)
+            for row in df[columns].itertuples(index=False, name=None)
+        ]
         with sqlite3.connect(self.db_path) as conn:
-            for d in df["date"].unique().tolist():
-                conn.execute("DELETE FROM stock_daily WHERE date = ?", (d,))
-            df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi", chunksize=500)
+            conn.execute("DELETE FROM stock_daily WHERE date = ?", (today_str,))
+            conn.executemany(
+                """
+                INSERT INTO stock_daily
+                    (symbol, date, open, high, low, close, volume, turnover)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, date) DO UPDATE SET
+                    open=excluded.open, high=excluded.high, low=excluded.low,
+                    close=excluded.close, volume=excluded.volume,
+                    turnover=excluded.turnover
+                """,
+                values,
+            )
             conn.commit()
 
-        logger.info(f"sync_today_bulk: 写入 {count} 条数据")
-        return count
+        self.verified_symbols = received_current
+        self.verified_date = today_str
+        logger.info(
+            "sync_today_bulk: 发布 %d 条有效数据，%s 覆盖率 %.2f%%，失败股票=%d",
+            len(df),
+            today_str,
+            coverage * 100,
+            len(failed_symbols),
+        )
+        return len(df)
+
+    def is_trading_day(self, target_date: date | None = None) -> bool:
+        """Check BaoStock's exchange calendar; fail closed if unavailable."""
+        import baostock as bs
+
+        target = (target_date or datetime.now(ZoneInfo("Asia/Shanghai")).date()).isoformat()
+        login = bs.login()
+        if login.error_code != "0":
+            raise DataIntegrityError(f"BaoStock 登录失败，无法读取交易日历：{login.error_msg}")
+        try:
+            result = bs.query_trade_dates(start_date=target, end_date=target)
+            if result.error_code != "0":
+                raise DataIntegrityError(f"BaoStock 交易日历查询失败：{result.error_msg}")
+            while result.next():
+                row = result.get_row_data()
+                if row and row[0] == target:
+                    return row[1] == "1"
+            raise DataIntegrityError(f"BaoStock 未返回 {target} 的交易日状态")
+        finally:
+            bs.logout()
 
     def backfill(self, symbols: list[str]) -> None:
         """通过 baostock 批量回填历史日 K 线数据（后复权）。
@@ -330,4 +530,7 @@ class DataEngine:
             rows = conn.execute(
                 "SELECT DISTINCT symbol FROM stock_daily"
             ).fetchall()
-        return [row[0] for row in rows]
+        symbols = [row[0] for row in rows]
+        if self.verified_symbols is not None:
+            return [symbol for symbol in symbols if symbol in self.verified_symbols]
+        return symbols

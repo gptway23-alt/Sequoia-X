@@ -24,6 +24,12 @@ class RpsBreakoutStrategy(BaseStrategy):
         if df.empty:
             return []
 
+        verified_symbols = getattr(self.engine, "verified_symbols", None)
+        if verified_symbols is not None:
+            df = df[df["symbol"].isin(verified_symbols)]
+            if df.empty:
+                return []
+
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values(['symbol', 'date'])
 

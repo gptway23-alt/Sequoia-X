@@ -1,10 +1,7 @@
 """配置管理属性测试。"""
 
-import os
-import pytest
 from hypothesis import given, settings as h_settings, HealthCheck
 from hypothesis import strategies as st
-from pydantic import ValidationError
 
 
 # Feature: sequoia-x-v2, Property 1: 环境变量覆盖配置默认值
@@ -21,17 +18,11 @@ def test_env_overrides_default(db_path: str, monkeypatch) -> None:
     assert s.db_path == db_path
 
 
-# Feature: sequoia-x-v2, Property 2: 缺失必填字段触发 ValidationError
-def test_missing_required_field_raises() -> None:
-    """属性 2：缺少 feishu_webhook_url 时，实例化 Settings 应抛出 ValidationError。"""
-    import os
+# The webhook remains optional for the Gmail-only Actions workflow.
+def test_feishu_webhook_is_optional_for_email_workflow(monkeypatch) -> None:
+    """Email-only deployments can start without the legacy Feishu webhook."""
     from sequoia_x.core.config import Settings
-    # 确保环境变量中没有该字段
-    env_backup = os.environ.pop("FEISHU_WEBHOOK_URL", None)
-    try:
-        with pytest.raises(ValidationError) as exc_info:
-            Settings(_env_file=None)
-        assert "feishu_webhook_url" in str(exc_info.value).lower()
-    finally:
-        if env_backup is not None:
-            os.environ["FEISHU_WEBHOOK_URL"] = env_backup
+
+    monkeypatch.delenv("FEISHU_WEBHOOK_URL", raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.feishu_webhook_url is None
