@@ -1,7 +1,7 @@
 """主程序入口属性测试。"""
 
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from hypothesis import given, settings as h_settings
@@ -21,3 +21,55 @@ def test_main_exits_nonzero_on_exception(error_msg: str) -> None:
         with pytest.raises(SystemExit) as exc_info:
             main_module.main()
         assert exc_info.value.code != 0
+
+
+def test_email_failure_does_not_stop_later_strategies(monkeypatch) -> None:
+    """A failed email is reported after every strategy has had a chance to run."""
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+
+    class FakeEngine:
+        def __init__(self, settings) -> None:
+            pass
+
+        def get_all_symbols(self) -> list[str]:
+            return ["000001"]
+
+        def get_local_symbols(self) -> list[str]:
+            return ["000001"]
+
+        def sync_today_bulk(self) -> int:
+            return 1
+
+    strategy_runs: list[str] = []
+
+    class FakeStrategy:
+        webhook_key = "test"
+
+        def __init__(self, engine, settings) -> None:
+            pass
+
+        def run(self) -> list[str]:
+            strategy_runs.append("run")
+            return ["000001"]
+
+    notifier = MagicMock()
+    notifier.send.side_effect = [False, True, True, True, True, True, True]
+
+    with (
+        patch.object(main_module, "get_settings", return_value=object()),
+        patch.object(main_module, "DataEngine", FakeEngine),
+        patch.object(main_module, "EmailNotifier", return_value=notifier),
+        patch.object(main_module, "MaVolumeStrategy", FakeStrategy),
+        patch.object(main_module, "TurtleTradeStrategy", FakeStrategy),
+        patch.object(main_module, "HighTightFlagStrategy", FakeStrategy),
+        patch.object(main_module, "LimitUpShakeoutStrategy", FakeStrategy),
+        patch.object(main_module, "UptrendLimitDownStrategy", FakeStrategy),
+        patch.object(main_module, "RpsBreakoutStrategy", FakeStrategy),
+        patch.object(main_module, "PrivatePlacementStrategy", FakeStrategy),
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            main_module.main()
+
+    assert exc_info.value.code == 2
+    assert len(strategy_runs) == 7
+    assert notifier.send.call_count == 7

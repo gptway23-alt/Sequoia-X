@@ -43,6 +43,7 @@ def main() -> None:
         help="回填模式：通过 baostock 拉取全市场历史 K 线",
     )
     args = parser.parse_args()
+    notification_failures: list[str] = []
 
     try:
         # 1. 初始化配置
@@ -150,11 +151,13 @@ def main() -> None:
             )
 
             if selected:
-                notifier.send(
+                sent = notifier.send(
                     symbols=selected,
                     strategy_name=strategy_name,
                     webhook_key=strategy.webhook_key,
                 )
+                if not sent:
+                    notification_failures.append(strategy_name)
             else:
                 logger.info(
                     f"{strategy_name} 无选股结果，跳过推送"
@@ -171,6 +174,13 @@ def main() -> None:
             traceback.print_exc()
 
         sys.exit(1)
+
+    if notification_failures:
+        logger.error(
+            "行情与策略流程已完成，但邮件发送失败：%s",
+            ", ".join(notification_failures),
+        )
+        sys.exit(2)
 
     logger.info("Sequoia-X V2 运行完成")
 
