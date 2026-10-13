@@ -25,11 +25,6 @@ class PrivatePlacementStrategy(BaseStrategy):
 
     def run(self) -> list[str]:
         """拉取定增公告，返回近期有定向增发的股票代码列表。"""
-        verified_symbols = set(self.engine.get_local_symbols())
-        if self.engine.strategy_snapshot_date is None or not verified_symbols:
-            logger.error("PrivatePlacementStrategy 缺少已核验的策略快照")
-            return []
-
         try:
             import akshare as ak
 
@@ -49,13 +44,12 @@ class PrivatePlacementStrategy(BaseStrategy):
             return []
 
         # 按发行日期过滤：只保留最近 N 天内的公告
-        today = date.fromisoformat(self.engine.strategy_snapshot_date)
+        today = date.today()
         cutoff = today - timedelta(days=self._LOOKBACK_DAYS)
 
         df["发行日期"] = pd.to_datetime(df["发行日期"], errors="coerce")
         df = df.dropna(subset=["发行日期"])
-        issue_dates = df["发行日期"].dt.date
-        df = df[(issue_dates >= cutoff) & (issue_dates <= today)]
+        df = df[df["发行日期"].dt.date >= cutoff]
 
         if df.empty:
             logger.info("PrivatePlacementStrategy 近期无新定增公告")
@@ -65,19 +59,13 @@ class PrivatePlacementStrategy(BaseStrategy):
         df = df.sort_values("发行日期", ascending=False)
 
         # 提取股票代码（去掉可能的前缀，保留纯数字）
-        symbols = (
-            df["股票代码"]
-            .astype(str)
-            .str.extract(r"(\d{6})")[0]
-            .dropna()
-            .tolist()
-        )
+        symbols = df["股票代码"].astype(str).str.extract(r"(\d{6})")[0].dropna().tolist()
 
         # 去重（同一只票可能有多次定增）
         seen = set()
         unique_symbols = []
         for s in symbols:
-            if s in verified_symbols and s not in seen:
+            if s not in seen:
                 seen.add(s)
                 unique_symbols.append(s)
 

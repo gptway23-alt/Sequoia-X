@@ -18,8 +18,6 @@ ENV/
 
 # 数据库文件
 data/*.db
-gpt-export/
-reports/
 
 # 环境变量
 .env
@@ -32,21 +30,9 @@ build/
 # 测试与工具缓存
 .pytest_cache/
 .ruff_cache/
-.tmp/
-.pip-tmp/
-.smoke-manual/
-.manual-pytest/
-.manual-*/
-.gpt-export-smoke-*/
 
 # 日志
 *.log
 
 # Hypothesis 测试缓存
 .hypothesis/
-
-# V10 gateway secrets, backups and future sqlite sidecars
-.env.gateway
-backups/
-data/*.db-*
-data/*.sqlite3*

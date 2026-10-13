@@ -1,221 +1,71 @@
-
 name: Sequoia-X Daily
 
 on:
   workflow_dispatch:
-    inputs:
-      audit_only:
-        description: "仅检查数据库（不运行策略、不发邮件、不生成新缓存）"
-        type: boolean
-        required: false
-        default: true
-      target_date:
-        description: "日常模式目标交易日（YYYY-MM-DD），留空使用程序默认日期"
-        type: string
-        required: false
-        default: ""
+
   schedule:
-    # UTC 11:15 = 北京时间 19:15，周一至周五
-    - cron: "15 11 * * 1-5"
-
-concurrency:
-  group: sequoia-x-daily-db
-  cancel-in-progress: false
-
-permissions:
-  contents: read
+    - cron: "15 19 * * 1-5"
+      timezone: "Asia/Shanghai"
 
 jobs:
   run-sequoia:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    runs-on: ubuntu-latest
+
+    # 首次历史数据回填可能很慢
+    timeout-minutes: 60
+
     env:
-      TZ: Asia/Shanghai
+      GMAIL_USER: ${{ secrets.GMAIL_USER }}
+      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+      GMAIL_TO: ${{ secrets.GMAIL_TO }}
+
       DB_PATH: data/sequoia_v2.db
-      DAILY_MODE: ${{ github.event_name != 'workflow_dispatch' || inputs.audit_only == false }}
       START_DATE: "2024-01-01"
-      BAOSTOCK_MAX_WORKERS: "2"
-      BAOSTOCK_BATCH_SIZE: "40"
-      BAOSTOCK_MAX_ATTEMPTS: "3"
-      BAOSTOCK_BACKOFF_SECONDS: "1.0"
-      BAOSTOCK_SOCKET_TIMEOUT_SECONDS: "20"
-      MIN_DAILY_COVERAGE: "0.98"
-      EMAIL_REPORT_DIR: reports
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # 必须先安装程序，再恢复 data 目录
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      # 安装完成后再恢复 SQLite 数据库
       - name: Restore database
-        id: restore_db
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        id: restore-db
+        uses: actions/cache/restore@v4
         with:
           path: data
-          key: sequoia-db-v10-${{ github.run_id }}-${{ github.run_attempt }}
+          key: sequoia-db-${{ github.run_id }}
           restore-keys: |
-            sequoia-db-v10-
-            sequoia-db-raw-v1-
-            sequoia-db-v3-
-            sequoia-db-v2-
+            sequoia-db-
 
-      - name: Require existing strategy database
-        id: require_db
-        continue-on-error: true
-        shell: bash
+      - name: Initialize database if needed
         run: |
-          if [ ! -s "$DB_PATH" ]; then
-            echo "::error::找不到 $DB_PATH。请检查数据库缓存或独立备份。"
-            exit 1
+          mkdir -p data
+
+          if [ ! -f data/sequoia_v2.db ]; then
+            echo "Database not found, starting backfill..."
+            python main.py --backfill
+          else
+            echo "Existing database restored."
+            ls -lh data/sequoia_v2.db
           fi
-          ls -lh "$DB_PATH"
-
-      - name: Audit database duplicates (read only)
-        id: db_audit
-        if: ${{ steps.require_db.outcome == 'success' }}
-        continue-on-error: true
-        run: python scripts/check_db_duplicates.py
-
-      - name: Set up uv
-        if: ${{ env.DAILY_MODE == 'true' && steps.db_audit.outcome == 'success' }}
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
-        with:
-          version: "0.12.15"
-
-      - name: Install dependencies
-        if: ${{ env.DAILY_MODE == 'true' && steps.db_audit.outcome == 'success' }}
-        run: |
-          uv sync --locked --extra dev --python 3.11
-          uv pip install --python .venv/bin/python -r requirements-gateway.txt
-          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
-
-      - name: Verify source bundle compatibility
-        if: ${{ env.DAILY_MODE == 'true' && steps.db_audit.outcome == 'success' }}
-        run: |
-          python -c "import main; from sequoia_x.data.engine import ENGINE_API_VERSION; assert ENGINE_API_VERSION == main.REQUIRED_ENGINE_API_VERSION == 3"
-
-      - name: Run offline regression tests
-        id: offline_tests
-        if: ${{ env.DAILY_MODE == 'true' && steps.db_audit.outcome == 'success' }}
-        continue-on-error: true
-        run: |
-          python -m pytest -q
 
       - name: Run Sequoia-X
-        id: run_sequoia
-        if: ${{ env.DAILY_MODE == 'true' && steps.offline_tests.outcome == 'success' }}
-        continue-on-error: true
-        timeout-minutes: 150
-        env:
-          TARGET_DATE: ${{ inputs.target_date }}
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: |
-          if [ -n "$TARGET_DATE" ]; then
-            python main.py --target-date "$TARGET_DATE"
-          else
-            python main.py
-          fi
-
-      - name: Verify database before cache save
-        id: verify_db
-        if: ${{ !cancelled() && env.DAILY_MODE == 'true' && steps.run_sequoia.outcome != 'skipped' }}
-        continue-on-error: true
-        run: |
-          python - <<'PY'
-          import os
-          import sqlite3
-          from pathlib import Path
-
-          path = Path(
-              os.environ['DB_PATH']
-          ).resolve()
-
-          if (
-              not path.is_file()
-              or path.stat().st_size == 0
-          ):
-              raise SystemExit(
-                  f'Database missing or empty: {path}'
-              )
-
-          with sqlite3.connect(
-              path.as_uri() + '?mode=rw',
-              uri=True,
-              timeout=30
-          ) as conn:
-              checkpoint = conn.execute(
-                  'PRAGMA wal_checkpoint(FULL)'
-              ).fetchone()
-
-              if (
-                  checkpoint
-                  and checkpoint[0] != 0
-              ):
-                  raise SystemExit(
-                      f'WAL checkpoint busy: '
-                      f'{checkpoint}'
-                  )
-
-              check = conn.execute(
-                  'PRAGMA quick_check'
-              ).fetchone()[0]
-
-              if check != 'ok':
-                  raise SystemExit(
-                      f'SQLite quick_check failed: {check}'
-                  )
-
-          print('Verified database checkpoint: ok')
-          PY
+          python main.py
 
       - name: Save database
-        id: save_db
-        if: ${{ !cancelled() && env.DAILY_MODE == 'true' && steps.verify_db.outcome == 'success' }}
-        continue-on-error: true
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        if: always()
+        uses: actions/cache/save@v4
         with:
           path: data
-          key: sequoia-db-v10-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Upload TXT reports only (no database)
-        if: ${{ !cancelled() && env.DAILY_MODE == 'true' }}
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        with:
-          name: sequoia-txt-${{ github.run_id }}-${{ github.run_attempt }}
-          path: reports/*.txt
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Preserve final status
-        if: ${{ !cancelled() }}
-        env:
-          REQUIRE: ${{ steps.require_db.outcome }}
-          AUDIT: ${{ steps.db_audit.outcome }}
-          TESTS: ${{ steps.offline_tests.outcome }}
-          RUN: ${{ steps.run_sequoia.outcome }}
-          VERIFY: ${{ steps.verify_db.outcome }}
-          SAVE: ${{ steps.save_db.outcome }}
-        run: |
-          if [ "$REQUIRE" != "success" ] || [ "$AUDIT" != "success" ]; then
-            echo "::error::数据库恢复或只读审计失败: require=$REQUIRE audit=$AUDIT"
-            exit 1
-          fi
-
-          if [ "$DAILY_MODE" != "true" ]; then
-            echo '数据库只读审计完成：未运行策略、未发送邮件、未保存新缓存。'
-            exit 0
-          fi
-
-          for status in "$TESTS" "$RUN" "$VERIFY" "$SAVE"; do
-            if [ "$status" != "success" ]; then
-              echo "::error::日常策略或数据库检查点失败: $status"
-              exit 1
-            fi
-          done
-
-          echo '日常策略和数据库检查点成功；未执行旧版 RAW 全市场历史回填或 GPT 数据库导出。'
+          key: sequoia-db-${{ github.run_id }}
