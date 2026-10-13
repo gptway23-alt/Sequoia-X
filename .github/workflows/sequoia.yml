@@ -7,12 +7,19 @@ on:
     - cron: "15 19 * * 1-5"
       timezone: "Asia/Shanghai"
 
+concurrency:
+  group: sequoia-x-database-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
   run-sequoia:
     runs-on: ubuntu-latest
 
-    # 首次历史数据回填可能很慢
-    timeout-minutes: 60
+    # 全市场回填和偶发的数据源超时可能超过一小时；GitHub 托管任务上限为 6 小时。
+    timeout-minutes: 180
 
     env:
       GMAIL_USER: ${{ secrets.GMAIL_USER }}
@@ -30,6 +37,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       # 必须先安装程序，再恢复 data 目录
       - name: Install dependencies
