@@ -77,26 +77,25 @@ ON CONFLICT(target_date, symbol, date) DO UPDATE SET
 # 研究信号历史只记录已发布行情对应的策略输出；不包含模拟交易账本。
 _CREATE_SELECTION_RUNS_SQL = """
 CREATE TABLE IF NOT EXISTS selection_runs (
-    selection_date TEXT NOT NULL PRIMARY KEY,
-    target_date TEXT NOT NULL,
-    status TEXT NOT NULL,
-    executed_strategies TEXT NOT NULL,
-    strategy_count INTEGER NOT NULL,
-    result_count INTEGER NOT NULL,
+    market_date TEXT NOT NULL PRIMARY KEY,
     recorded_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    expected_symbols INTEGER NOT NULL CHECK (expected_symbols >= 0),
+    verified_symbols INTEGER NOT NULL CHECK (verified_symbols >= 0),
+    coverage REAL NOT NULL CHECK (coverage >= 0.0 AND coverage <= 1.0),
+    verified_symbols_json TEXT NOT NULL,
+    strategies_json TEXT NOT NULL,
+    result_rows INTEGER NOT NULL CHECK (result_rows >= 0)
 );
 """
 
 _CREATE_SELECTION_RESULTS_SQL = """
 CREATE TABLE IF NOT EXISTS selection_results (
-    selection_date TEXT NOT NULL,
+    market_date TEXT NOT NULL,
+    strategy TEXT NOT NULL,
     symbol TEXT NOT NULL,
-    strategies TEXT NOT NULL,
-    strategy_hit_count INTEGER NOT NULL,
-    recorded_at TEXT NOT NULL,
-    PRIMARY KEY (selection_date, symbol),
-    FOREIGN KEY (selection_date) REFERENCES selection_runs(selection_date)
+    PRIMARY KEY (market_date, strategy, symbol),
+    FOREIGN KEY (market_date)
+        REFERENCES selection_runs(market_date) ON DELETE CASCADE
 );
 """
 
@@ -911,7 +910,13 @@ class DataEngine:
             staged_raw, expected_symbols=expected, target_date=target_text,
         )
         if invalid_staged:
-            raise DataIntegrityError(f"已缓存的暂存行情校验失败: {invalid_staged}")
+            # 忽略旧版本或损坏暂存中的异常记录，避免一条意外代码阻断
+            # 其余经过校验行情的续传；正式发布仍只接收 expected 集合。
+            with sqlite3.connect(self.db_path) as conn:
+                conn.executemany(
+                    "DELETE FROM stock_daily_staging WHERE target_date = ? AND symbol = ?",
+                    [(target_text, symbol) for symbol in invalid_staged],
+                )
         if verified_before == expected:
             return SyncReport(
                 status=SYNC_COMPLETE,
@@ -1011,7 +1016,7 @@ class DataEngine:
                 target_date=target_text,
                 is_trade_day=True,
                 expected_symbols=len(expected),
-                verified_symbols=frozenset(verified_before),
+                verified_symbols=frozenset(candidate_verified),
                 failed_symbols=failed_symbols,
                 stale_symbols=frozenset(stale_symbols),
                 candidate_verified_count=len(candidate_verified),
@@ -1208,7 +1213,7 @@ class DataEngine:
                 if len(symbol) != 6 or not symbol.isdigit():
                     raise DataIntegrityError(f"选股代码不合法: {original!r}")
                 if symbol not in sync_report.verified_symbols:
-                    raise DataIntegrityError(f"缺少同日有效已发布行情: {symbol}")
+                    raise DataIntegrityError(f"{strategy} 包含未通过同日行情核验的股票: {symbol}")
                 selected.setdefault(symbol, set()).add(strategy)
 
         now = datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")
@@ -1217,77 +1222,63 @@ class DataEngine:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 # 必须在同一事务里验证真实同日价，不能只信任报告的字符串集合。
-                published = (
-                    self._get_verified_symbols_from_connection(conn, report_date)
-                    & set(selected)
-                )
-                missing = set(selected) - published
+                published = self._get_verified_symbols_from_connection(conn, report_date)
+                missing = set(sync_report.verified_symbols) - published
                 if missing:
                     raise DataIntegrityError(
                         "缺少同日有效已发布行情: " + ",".join(sorted(missing))
                     )
 
                 current = conn.execute(
-                    "SELECT executed_strategies, result_count, recorded_at "
-                    "FROM selection_runs WHERE selection_date = ?",
+                    "SELECT expected_symbols, verified_symbols, coverage, "
+                    "verified_symbols_json, strategies_json, result_rows, recorded_at "
+                    "FROM selection_runs WHERE market_date = ?",
                     (report_date,),
                 ).fetchone()
-                existing_results = {
-                    symbol: tuple(json.loads(names))
-                    for symbol, names in conn.execute(
-                        "SELECT symbol, strategies FROM selection_results "
-                        "WHERE selection_date = ?",
-                        (report_date,),
-                    ).fetchall()
-                }
-                target_results = {
-                    symbol: tuple(sorted(names))
+                existing_results = conn.execute(
+                    "SELECT market_date, strategy, symbol FROM selection_results "
+                    "WHERE market_date = ? ORDER BY strategy, symbol",
+                    (report_date,),
+                ).fetchall()
+                target_results = sorted(
+                    (report_date, strategy, symbol)
                     for symbol, names in selected.items()
-                }
+                    for strategy in names
+                )
                 exact_rerun = bool(
                     current
-                    and json.loads(current[0]) == strategies
+                    and current[0] == sync_report.expected_symbols
+                    and current[1] == len(sync_report.verified_symbols)
+                    and math.isclose(current[2], sync_report.coverage, rel_tol=0, abs_tol=1e-12)
+                    and json.loads(current[3]) == sorted(sync_report.verified_symbols)
+                    and json.loads(current[4]) == strategies
+                    and current[5] == len(target_results)
                     and existing_results == target_results
                 )
                 if exact_rerun:
-                    conn.rollback()  # 幂等重跑不改变首次登记时间
+                    conn.rollback()
                     return len(target_results)
 
-                # 在单一事务中替换同一信号日；任何错误都回滚。
                 conn.execute(
-                    """INSERT INTO selection_runs
-                       (selection_date, target_date, status, executed_strategies,
-                        strategy_count, result_count, recorded_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(selection_date) DO UPDATE SET
-                         target_date=excluded.target_date,
-                         status=excluded.status,
-                         executed_strategies=excluded.executed_strategies,
-                         strategy_count=excluded.strategy_count,
-                         result_count=excluded.result_count,
-                         updated_at=excluded.updated_at""",
-                    (
-                        report_date, report_date, sync_report.status,
-                        json.dumps(strategies, ensure_ascii=False), len(strategies),
-                        len(target_results), now, now,
-                    ),
-                )
-                conn.execute(
-                    "DELETE FROM selection_results WHERE selection_date = ?",
+                    "DELETE FROM selection_results WHERE market_date = ?",
                     (report_date,),
                 )
+                conn.execute("DELETE FROM selection_runs WHERE market_date = ?", (report_date,))
+                conn.execute(
+                    """INSERT INTO selection_runs
+                       (market_date, recorded_at, expected_symbols, verified_symbols,
+                        coverage, verified_symbols_json, strategies_json, result_rows)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        report_date, now, sync_report.expected_symbols,
+                        len(sync_report.verified_symbols), sync_report.coverage,
+                        json.dumps(sorted(sync_report.verified_symbols), ensure_ascii=False),
+                        json.dumps(strategies, ensure_ascii=False), len(target_results),
+                    ),
+                )
                 conn.executemany(
-                    """INSERT INTO selection_results
-                       (selection_date, symbol, strategies, strategy_hit_count, recorded_at)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    [
-                        (
-                            report_date, symbol,
-                            json.dumps(names, ensure_ascii=False),
-                            len(names), now,
-                        )
-                        for symbol, names in sorted(target_results.items())
-                    ],
+                    "INSERT INTO selection_results (market_date, strategy, symbol) VALUES (?, ?, ?)",
+                    target_results,
                 )
                 conn.commit()
                 return len(target_results)
