@@ -78,6 +78,12 @@ def _fake_executor(monkeypatch, returned_symbols: set[str], failed: set[str] | N
         def result(self) -> BatchResult:
             return self._result
 
+        def cancel(self) -> bool:
+            return False
+
+        def cancelled(self) -> bool:
+            return False
+
     class FakeExecutor:
         def __init__(self, max_workers: int):
             assert max_workers <= 2
@@ -88,8 +94,8 @@ def _fake_executor(monkeypatch, returned_symbols: set[str], failed: set[str] | N
         def __exit__(self, *_args):
             return False
 
-        def submit(self, _function, payload):
-            tasks, _attempts, _backoff = payload
+        def submit(self, _function, payload, _timeout):
+            tasks, _attempts, _backoff, _socket_timeout = payload
             rows = []
             for symbol, _code, _start, end in tasks:
                 if symbol in returned_symbols:
@@ -97,7 +103,7 @@ def _fake_executor(monkeypatch, returned_symbols: set[str], failed: set[str] | N
             failed_in_batch = [symbol for symbol, *_ in tasks if failed and symbol in failed]
             return FakeFuture(BatchResult(rows, failed_in_batch, []))
 
-    monkeypatch.setattr(engine_module, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(engine_module, "ThreadPoolExecutor", FakeExecutor)
     monkeypatch.setattr(engine_module, "as_completed", lambda futures: list(futures))
 
 

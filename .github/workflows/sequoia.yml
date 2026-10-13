@@ -28,6 +28,12 @@ jobs:
 
       DB_PATH: data/sequoia_v2.db
       START_DATE: "2024-01-01"
+      BAOSTOCK_MAX_WORKERS: "2"
+      BAOSTOCK_BATCH_SIZE: "25"
+      BAOSTOCK_MAX_ATTEMPTS: "2"
+      BAOSTOCK_BACKOFF_SECONDS: "1"
+      BAOSTOCK_SOCKET_TIMEOUT_SECONDS: "15"
+      BAOSTOCK_BATCH_TIMEOUT_SECONDS: "120"
 
     steps:
       - name: Checkout repository

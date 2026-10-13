@@ -1,7 +1,9 @@
 """数据引擎模块：负责 SQLite 行情数据存储与 baostock 增量同步。"""
 
 import sqlite3
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -48,9 +50,14 @@ class BatchResult:
 
 def _bs_fetch_batch(payload: tuple) -> BatchResult:
     """Fetch one isolated BaoStock batch, reconnecting and retrying boundedly."""
-    tasks, max_attempts, backoff_seconds = payload
+    tasks, max_attempts, backoff_seconds, socket_timeout_seconds = payload
     import time
 
+    import socket
+
+    # BaoStock performs blocking socket I/O. Bound each connect/read so retries
+    # can run even when the remote endpoint stops responding.
+    socket.setdefaulttimeout(socket_timeout_seconds)
     import baostock as bs
 
     rows: list[list[str]] = []
@@ -119,6 +126,94 @@ def _bs_fetch_batch(payload: tuple) -> BatchResult:
             pass
 
     return BatchResult(rows, failed, errors)
+
+
+def _batch_process_entry(payload: tuple, sender) -> None:
+    """Run one batch in a killable process and return its result to the parent."""
+    try:
+        result = _bs_fetch_batch(payload)
+    except Exception as exc:
+        tasks = payload[0]
+        result = BatchResult(
+            [],
+            [task[0] for task in tasks],
+            [f"batch worker failed: {type(exc).__name__}: {exc}"],
+        )
+    try:
+        sender.send(result)
+    except (BrokenPipeError, EOFError, OSError):
+        pass
+    finally:
+        sender.close()
+
+
+def _stop_process(process) -> None:
+    """Terminate a batch worker and reap it, escalating if necessary."""
+    if not process.is_alive():
+        process.join()
+        return
+    process.terminate()
+    process.join(timeout=3)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=3)
+
+
+def _run_batch_with_timeout(payload: tuple, timeout_seconds: int) -> BatchResult:
+    """Run one BaoStock batch with a hard wall-clock timeout."""
+    tasks = payload[0]
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(target=_batch_process_entry, args=(payload, sender))
+    started = False
+    try:
+        process.start()
+        started = True
+        sender.close()
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _stop_process(process)
+                return BatchResult(
+                    [],
+                    [task[0] for task in tasks],
+                    [f"batch timed out after {timeout_seconds} seconds"],
+                )
+            if receiver.poll(min(0.25, remaining)):
+                try:
+                    result = receiver.recv()
+                except EOFError:
+                    process.join(timeout=1)
+                    return BatchResult(
+                        [],
+                        [task[0] for task in tasks],
+                        ["batch worker exited without returning a result"],
+                    )
+                process.join(timeout=1)
+                if process.is_alive():
+                    _stop_process(process)
+                return result
+            if not process.is_alive():
+                process.join()
+                return BatchResult(
+                    [],
+                    [task[0] for task in tasks],
+                    [f"batch worker exited with code {process.exitcode} without a result"],
+                )
+    except Exception as exc:
+        if started:
+            _stop_process(process)
+        return BatchResult(
+            [],
+            [task[0] for task in tasks],
+            [f"batch supervisor failed: {type(exc).__name__}: {exc}"],
+        )
+    finally:
+        receiver.close()
+        sender.close()
+        if started and process.is_alive():
+            _stop_process(process)
 
 
 class DataEngine:
@@ -213,7 +308,12 @@ class DataEngine:
         batch_size = self.settings.baostock_batch_size
         batches = [tasks[i : i + batch_size] for i in range(0, len(tasks), batch_size)]
         payloads = [
-            (batch, self.settings.baostock_max_attempts, self.settings.baostock_backoff_seconds)
+            (
+                batch,
+                self.settings.baostock_max_attempts,
+                self.settings.baostock_backoff_seconds,
+                self.settings.baostock_socket_timeout_seconds,
+            )
             for batch in batches
         ]
 
@@ -225,30 +325,49 @@ class DataEngine:
             min(self.settings.baostock_max_workers, len(batches)),
             self.settings.baostock_max_attempts,
         )
+        logger.info(
+            "行情抓取超时限制：单次网络请求 %d 秒，单批次 %d 秒",
+            self.settings.baostock_socket_timeout_seconds,
+            self.settings.baostock_batch_timeout_seconds,
+        )
 
         results: list[BatchResult] = []
         failed_symbols: set[str] = set()
         batch_errors: list[str] = []
         failed_batches = 0
         max_workers = min(self.settings.baostock_max_workers, len(batches))
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_batches = {
-                executor.submit(_bs_fetch_batch, payload): batch
-                for payload, batch in zip(payloads, batches)
+                executor.submit(
+                    _run_batch_with_timeout,
+                    payload,
+                    self.settings.baostock_batch_timeout_seconds,
+                ): (index, batch)
+                for index, (payload, batch) in enumerate(zip(payloads, batches), start=1)
             }
 
             def cancel_queued_batches() -> None:
-                for pending, pending_batch in future_batches.items():
+                for pending, (_index, pending_batch) in future_batches.items():
                     if pending.cancel():
                         failed_symbols.update(task[0] for task in pending_batch)
 
+            completed_batches = 0
             for future in as_completed(future_batches):
-                batch = future_batches[future]
+                batch_index, batch = future_batches[future]
+                completed_batches += 1
                 try:
                     result = future.result()
                 except Exception as exc:
                     failed_symbols.update(task[0] for task in batch)
                     batch_errors.append(str(exc))
+                    logger.warning(
+                        "行情批次进度 %d/%d：批次 %d/%d 异常：%s",
+                        completed_batches,
+                        len(batches),
+                        batch_index,
+                        len(batches),
+                        exc,
+                    )
                     if not future.cancelled():
                         failed_batches += 1
                         if failed_batches >= max_workers:
@@ -258,6 +377,15 @@ class DataEngine:
                 results.append(result)
                 failed_symbols.update(result.failed_symbols)
                 batch_errors.extend(result.errors[:3])
+                logger.info(
+                    "行情批次进度 %d/%d：批次 %d/%d 完成，有效行=%d，失败股票=%d",
+                    completed_batches,
+                    len(batches),
+                    batch_index,
+                    len(batches),
+                    len(result.rows),
+                    len(result.failed_symbols),
+                )
                 if len(result.failed_symbols) == len(batch):
                     failed_batches += 1
                     if failed_batches >= max_workers:

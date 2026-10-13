@@ -10,9 +10,11 @@ class Settings(BaseSettings):
     feishu_webhook_url: str | None = None
     strategy_webhooks: dict[str, str] = {}
     baostock_max_workers: int = Field(default=2, ge=1, le=4)
-    baostock_batch_size: int = Field(default=100, ge=10, le=500)
-    baostock_max_attempts: int = Field(default=3, ge=1, le=5)
+    baostock_batch_size: int = Field(default=25, ge=10, le=100)
+    baostock_max_attempts: int = Field(default=2, ge=1, le=3)
     baostock_backoff_seconds: float = Field(default=1.0, ge=0, le=60)
+    baostock_socket_timeout_seconds: int = Field(default=15, ge=5, le=120)
+    baostock_batch_timeout_seconds: int = Field(default=120, ge=15, le=600)
     min_market_data_coverage: float = Field(default=0.98, gt=0, le=1)
 
     model_config = SettingsConfigDict(
