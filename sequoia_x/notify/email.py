@@ -55,12 +55,18 @@ class EmailNotifier:
             + "\n".join(symbols)
         )
 
-        for attempt in range(2):
+        transports = ((465, True), (587, False))
+        for attempt, (port, implicit_tls) in enumerate(transports):
             delivery_started = False
             try:
-                with smtplib.SMTP_SSL(
-                    "smtp.gmail.com", 465, timeout=self.timeout_seconds
+                smtp_class = smtplib.SMTP_SSL if implicit_tls else smtplib.SMTP
+                with smtp_class(
+                    "smtp.gmail.com", port, timeout=self.timeout_seconds
                 ) as smtp:
+                    if not implicit_tls:
+                        smtp.ehlo()
+                        smtp.starttls()
+                        smtp.ehlo()
                     smtp.login(self.user, self.password)
                     delivery_started = True
                     refused = smtp.send_message(msg)
@@ -86,15 +92,16 @@ class EmailNotifier:
                     return False
                 if attempt == 0:
                     logger.warning(
-                        "Gmail SMTP 登录/连接失败，将重试一次（策略=%s）：%s",
+                        "Gmail SMTP 465/SSL 登录前连接失败，将改用 587/STARTTLS 重试一次（策略=%s）：%s",
                         strategy_name,
                         exc,
                     )
                     time.sleep(self.retry_delay_seconds)
                 else:
                     logger.error(
-                        "Gmail SMTP 登录/连接重试后仍失败（策略=%s）：%s",
+                        "Gmail SMTP 465/SSL 与 587/STARTTLS 均失败（策略=%s，端口=%d）：%s",
                         strategy_name,
+                        port,
                         exc,
                     )
 
