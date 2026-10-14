@@ -65,7 +65,7 @@ def test_email_failure_does_not_stop_later_strategies(monkeypatch) -> None:
             return ["000001", "000002"]
 
     notifier = MagicMock()
-    notifier.send.side_effect = [False, True, True, True, True, True, True]
+    notifier.send.return_value = False
 
     with (
         patch.object(main_module, "get_settings", return_value=object()),
@@ -85,9 +85,9 @@ def test_email_failure_does_not_stop_later_strategies(monkeypatch) -> None:
 
     assert exc_info.value.code == 2
     assert len(strategy_runs) == 7
-    assert notifier.send.call_count == 7
-    assert all(
-        call.kwargs["symbols"] == ["000001"]
-        and call.kwargs["verified_symbols"] == {"000001"}
-        for call in notifier.send.call_args_list
+    notifier.send.assert_called_once_with(
+        symbols=["000001"],
+        strategy_name="DailySummary",
+        strategy_results={"FakeStrategy": ["000001"]},
+        verified_symbols={"000001"},
     )

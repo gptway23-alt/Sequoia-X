@@ -74,6 +74,7 @@ class EmailNotifier:
         strategy_name: str,
         webhook_key: str = "default",
         verified_symbols: set[str] | None = None,
+        strategy_results: dict[str, list[str]] | None = None,
     ) -> bool:
         """Send a verified stock list with one bounded retry and Sent checking.
 
@@ -86,15 +87,41 @@ class EmailNotifier:
         if verified_symbols is None:
             logger.error("邮件未发送：缺少当日行情核验股票集合")
             return False
-        symbols = list(
-            dict.fromkeys(
-                symbol.strip()
-                for symbol in symbols
-                if isinstance(symbol, str)
-                and re.fullmatch(r"\d{6}", symbol.strip())
-                and symbol.strip() in verified_symbols
+
+        if strategy_results is not None:
+            verified_results: dict[str, list[str]] = {}
+            for name, result_symbols in strategy_results.items():
+                if not isinstance(name, str) or not isinstance(result_symbols, list):
+                    continue
+                clean_symbols = list(
+                    dict.fromkeys(
+                        symbol.strip()
+                        for symbol in result_symbols
+                        if isinstance(symbol, str)
+                        and re.fullmatch(r"\d{6}", symbol.strip())
+                        and symbol.strip() in verified_symbols
+                    )
+                )
+                if clean_symbols:
+                    verified_results[name] = clean_symbols
+            strategy_results = verified_results
+            symbols = list(
+                dict.fromkeys(
+                    symbol
+                    for result_symbols in strategy_results.values()
+                    for symbol in result_symbols
+                )
             )
-        )
+        else:
+            symbols = list(
+                dict.fromkeys(
+                    symbol.strip()
+                    for symbol in symbols
+                    if isinstance(symbol, str)
+                    and re.fullmatch(r"\d{6}", symbol.strip())
+                    and symbol.strip() in verified_symbols
+                )
+            )
         if not symbols:
             logger.info(
                 "邮件跳过：策略结果中没有当日行情已核验股票（策略=%s）",
@@ -106,29 +133,66 @@ class EmailNotifier:
             return False
 
         today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
-        digest = hashlib.sha256(
-            (strategy_name + "\n" + "\n".join(sorted(symbols))).encode("utf-8")
-        ).hexdigest()[:16]
         domain = self.user.rsplit("@", 1)[-1]
-        message_id = f"<sequoia-x-{today}-{digest}@{domain}>"
+        if strategy_results is not None:
+            # One stable daily ID prevents duplicate summary emails on reruns.
+            message_id = f"<sequoia-x-{today}-daily@{domain}>"
+        else:
+            digest = hashlib.sha256(
+                (strategy_name + "\n" + "\n".join(sorted(symbols))).encode("utf-8")
+            ).hexdigest()[:16]
+            message_id = f"<sequoia-x-{today}-{digest}@{domain}>"
 
         msg = EmailMessage()
-        msg["Subject"] = f"Sequoia-X | {strategy_name} | {len(symbols)}只"
         msg["From"] = self.user
         msg["To"] = ", ".join(self.recipients)
         msg["Message-ID"] = message_id
-        txt_content = "\n".join(symbols) + "\n"
-        msg.set_content(
-            f"Sequoia-X 选股结果\n\n"
-            f"策略：{strategy_name}\n"
-            f"选出股票数量：{len(symbols)}\n\n"
-            + txt_content
-        )
-        filename_strategy = re.sub(r"[^A-Za-z0-9_-]+", "_", strategy_name)
+
+        if strategy_results is not None:
+            symbol_strategies: dict[str, list[str]] = {}
+            for name, result_symbols in strategy_results.items():
+                for symbol in result_symbols:
+                    symbol_strategies.setdefault(symbol, []).append(name)
+            txt_lines = [
+                "Sequoia-X 每日选股汇总",
+                f"交易日期：{today}",
+                f"有结果策略数：{len(strategy_results)}",
+                f"去重股票数：{len(symbol_strategies)}",
+                "",
+                "策略统计：",
+            ]
+            txt_lines.extend(
+                f"{name}：{len(result_symbols)}只"
+                for name, result_symbols in sorted(strategy_results.items())
+            )
+            txt_lines.extend(["", "股票代码\t入选策略"])
+            txt_lines.extend(
+                f"{symbol}\t{', '.join(sorted(names))}"
+                for symbol, names in sorted(symbol_strategies.items())
+            )
+            txt_content = "\n".join(txt_lines) + "\n"
+            msg["Subject"] = (
+                f"Sequoia-X | {today} | 每日汇总 | "
+                f"{len(symbol_strategies)}只/{len(strategy_results)}个策略"
+            )
+            msg.set_content(txt_content)
+            filename = f"Sequoia-X-Daily-{today}.txt"
+        else:
+            txt_content = "\n".join(symbols) + "\n"
+            msg["Subject"] = f"Sequoia-X | {strategy_name} | {len(symbols)}只"
+            msg.set_content(
+                f"Sequoia-X 选股结果\n\n"
+                f"策略：{strategy_name}\n"
+                f"选出股票数量：{len(symbols)}\n\n"
+                + txt_content
+            )
+            filename_strategy = re.sub(r"[^A-Za-z0-9_-]+", "_", strategy_name)
+            filename = f"Sequoia-X-{filename_strategy}-{today}.txt"
+
         msg.add_attachment(
             txt_content,
             subtype="plain",
-            filename=f"Sequoia-X-{filename_strategy}-{today}.txt",
+            filename=filename,
         )
 
         try:

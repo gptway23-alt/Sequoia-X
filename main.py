@@ -158,6 +158,8 @@ def main() -> None:
         ]
 
         notifier = EmailNotifier(settings)
+        strategy_results: dict[str, list[str]] = {}
+        verified_symbols = getattr(engine, "verified_symbols", None)
 
         # 7. 执行策略
         for strategy in strategies:
@@ -167,7 +169,6 @@ def main() -> None:
 
             selected: list[str] = strategy.run()
 
-            verified_symbols = getattr(engine, "verified_symbols", None)
             if verified_symbols is not None:
                 before_filter = len(selected)
                 selected = [symbol for symbol in selected if symbol in verified_symbols]
@@ -183,18 +184,30 @@ def main() -> None:
             )
 
             if selected:
-                sent = notifier.send(
-                    symbols=selected,
-                    strategy_name=strategy_name,
-                    webhook_key=strategy.webhook_key,
-                    verified_symbols=verified_symbols,
-                )
-                if not sent:
-                    notification_failures.append(strategy_name)
+                strategy_results[strategy_name] = selected
             else:
                 logger.info(
                     f"{strategy_name} 无选股结果，跳过推送"
                 )
+
+        if strategy_results:
+            selected_symbols = list(
+                dict.fromkeys(
+                    symbol
+                    for symbols in strategy_results.values()
+                    for symbol in symbols
+                )
+            )
+            sent = notifier.send(
+                symbols=selected_symbols,
+                strategy_name="DailySummary",
+                strategy_results=strategy_results,
+                verified_symbols=verified_symbols,
+            )
+            if not sent:
+                notification_failures.append("DailySummary")
+        else:
+            logger.info("所有策略均无已核验选股结果，跳过邮件")
 
     except Exception:
         try:
