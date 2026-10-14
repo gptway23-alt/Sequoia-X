@@ -1,7 +1,7 @@
-"""数据引擎模块：负责 SQLite 行情数据存储与 baostock 增量同步。"""
+"""SQLite market data engine with BaoStock primary and AKShare fallback."""
 
-import sqlite3
 import multiprocessing
+import sqlite3
 import time
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -46,6 +46,171 @@ class BatchResult:
     rows: list[list[str]]
     failed_symbols: list[str]
     errors: list[str]
+
+
+def _akshare_fetch_batch(payload: tuple) -> BatchResult:
+    """Fetch bounded daily-history fallback rows from Tencent through AKShare."""
+    tasks, max_attempts, backoff_seconds, request_timeout_seconds = payload
+    import akshare as ak
+
+    rows: list[list[str]] = []
+    failed: list[str] = []
+    errors: list[str] = []
+
+    for symbol, _bs_code, start, end in tasks:
+        for attempt in range(max_attempts):
+            try:
+                frame = ak.stock_zh_a_hist_tx(
+                    symbol=symbol,
+                    start_date=start.replace("-", ""),
+                    end_date=end.replace("-", ""),
+                    adjust="hfq",
+                    timeout=request_timeout_seconds,
+                )
+                if frame is None or frame.empty:
+                    raise RuntimeError("Tencent history returned no rows")
+                required = {"date", "open", "high", "low", "close", "volume", "amount"}
+                if not required.issubset(frame.columns):
+                    raise ValueError(
+                        f"Tencent history missing columns: {sorted(required - set(frame.columns))}"
+                    )
+                for row in frame[
+                    ["date", "open", "high", "low", "close", "volume", "amount"]
+                ].itertuples(index=False, name=None):
+                    raw_date, open_, high, low, close, volume, amount = row
+                    parsed_date = pd.to_datetime(raw_date, errors="coerce")
+                    if pd.isna(parsed_date):
+                        continue
+                    rows.append(
+                        [
+                            symbol,
+                            parsed_date.date().isoformat(),
+                            str(open_),
+                            str(high),
+                            str(low),
+                            str(close),
+                            str(volume),
+                            str(amount),
+                        ]
+                    )
+                break
+            except Exception as exc:
+                if attempt + 1 >= max_attempts:
+                    failed.append(symbol)
+                    errors.append(f"{symbol}: {type(exc).__name__}: {exc}")
+                    break
+                delay = backoff_seconds * (2**attempt)
+                if delay:
+                    time.sleep(delay)
+
+    return BatchResult(rows, failed, errors)
+
+
+def _akshare_calendar_dates(_payload: object = None) -> list[str]:
+    """Read the Sina exchange calendar via AKShare and return ISO date strings."""
+    import akshare as ak
+
+    frame = ak.tool_trade_date_hist_sina()
+    if frame is None or frame.empty or "trade_date" not in frame.columns:
+        raise RuntimeError("Sina trade calendar is empty or has no trade_date column")
+    parsed = pd.to_datetime(frame["trade_date"], errors="coerce").dropna()
+    dates = sorted({value.date().isoformat() for value in parsed})
+    if not dates:
+        raise RuntimeError("Sina trade calendar contains no valid dates")
+    return dates
+
+
+def _akshare_stock_symbols(_payload: object = None) -> list[str]:
+    """Read the current A-share code list through AKShare."""
+    import akshare as ak
+
+    frame = ak.stock_info_a_code_name()
+    if frame is None or frame.empty or "code" not in frame.columns:
+        raise RuntimeError("AKShare stock list is empty or has no code column")
+    symbols = frame["code"].astype(str).str.extract(r"(\d{6})", expand=False).dropna()
+    result = sorted(set(symbols.tolist()))
+    if not result:
+        raise RuntimeError("AKShare stock list contains no valid six-digit codes")
+    return result
+
+
+def _isolated_task_entry(target, payload: object, sender) -> None:
+    """Run an AKShare task in a process that the caller can stop on timeout."""
+    try:
+        sender.send((True, target(payload)))
+    except Exception as exc:
+        try:
+            sender.send((False, f"{type(exc).__name__}: {exc}"))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        sender.close()
+
+
+def _run_isolated_task(target, payload: object, timeout_seconds: int):
+    """Run one potentially blocking AKShare operation with a hard deadline."""
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_isolated_task_entry,
+        args=(target, payload, sender),
+    )
+    started = False
+    try:
+        process.start()
+        started = True
+        sender.close()
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _stop_process(process)
+                raise TimeoutError(f"AKShare task timed out after {timeout_seconds} seconds")
+            if receiver.poll(min(0.25, remaining)):
+                try:
+                    succeeded, result = receiver.recv()
+                except EOFError as exc:
+                    raise RuntimeError("AKShare worker exited without returning a result") from exc
+                process.join(timeout=1)
+                if process.is_alive():
+                    _stop_process(process)
+                if not succeeded:
+                    raise RuntimeError(f"AKShare worker failed: {result}")
+                return result
+            if not process.is_alive():
+                process.join()
+                raise RuntimeError(
+                    f"AKShare worker exited with code {process.exitcode} without a result"
+                )
+    finally:
+        receiver.close()
+        sender.close()
+        if started and process.is_alive():
+            _stop_process(process)
+
+
+def _run_akshare_batch_with_timeout(payload: tuple, timeout_seconds: int) -> BatchResult:
+    """Run one AKShare fallback batch in a killable worker process."""
+    tasks = payload[0]
+    try:
+        result = _run_isolated_task(_akshare_fetch_batch, payload, timeout_seconds)
+        if not isinstance(result, BatchResult):
+            raise TypeError("AKShare history worker returned an invalid result")
+        return result
+    except Exception as exc:
+        return BatchResult(
+            [],
+            [task[0] for task in tasks],
+            [f"AKShare fallback batch failed: {type(exc).__name__}: {exc}"],
+        )
+
+
+def _run_akshare_calendar_with_timeout(timeout_seconds: int) -> list[str]:
+    return _run_isolated_task(_akshare_calendar_dates, None, timeout_seconds)
+
+
+def _run_akshare_symbols_with_timeout(timeout_seconds: int) -> list[str]:
+    return _run_isolated_task(_akshare_stock_symbols, None, timeout_seconds)
 
 
 def _bs_fetch_batch(payload: tuple) -> BatchResult:
@@ -216,8 +381,38 @@ def _run_batch_with_timeout(payload: tuple, timeout_seconds: int) -> BatchResult
             _stop_process(process)
 
 
+def _normalize_daily_rows(rows: list[list[str]], end_date: str) -> pd.DataFrame:
+    """Normalize provider rows and discard dates or bars that cannot be verified."""
+    columns = ["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]
+    frame = pd.DataFrame(rows, columns=columns)
+    if frame.empty:
+        return frame
+
+    frame["symbol"] = frame["symbol"].astype(str).str.zfill(6)
+    parsed_dates = pd.to_datetime(frame["date"], errors="coerce")
+    frame["date"] = parsed_dates.dt.strftime("%Y-%m-%d")
+    numeric_columns = ["open", "high", "low", "close", "volume", "turnover"]
+    for column in numeric_columns:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+    frame = frame.replace([float("inf"), float("-inf")], pd.NA)
+    frame = frame.dropna(subset=["symbol", "date", *numeric_columns])
+    frame = frame[
+        (frame["date"] <= end_date)
+        & (frame["open"] > 0)
+        & (frame["high"] > 0)
+        & (frame["low"] > 0)
+        & (frame["close"] > 0)
+        & (frame["volume"] > 0)
+        & (frame["turnover"] > 0)
+        & (frame["high"] >= frame[["open", "close", "low"]].max(axis=1))
+        & (frame["low"] <= frame[["open", "close", "high"]].min(axis=1))
+    ]
+    return frame.drop_duplicates(subset=["symbol", "date"], keep="last")
+
+
 class DataEngine:
-    """行情数据引擎，负责 SQLite 存储和 baostock 数据同步。"""
+    """SQLite data engine for BaoStock sync, AKShare fallback, and backfill."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -305,6 +500,7 @@ class DataEngine:
             tasks.append((symbol, self._to_baostock_code(symbol), start, today_str))
 
         expected_count = len(symbols)
+        requested_start_dates = {task[0]: task[2] for task in tasks}
         batch_size = self.settings.baostock_batch_size
         batches = [tasks[i : i + batch_size] for i in range(0, len(tasks), batch_size)]
         payloads = [
@@ -332,7 +528,6 @@ class DataEngine:
         )
 
         results: list[BatchResult] = []
-        failed_symbols: set[str] = set()
         batch_errors: list[str] = []
         failed_batch_streak = 0
         max_workers = min(self.settings.baostock_max_workers, len(batches))
@@ -353,9 +548,8 @@ class DataEngine:
                 if scheduling_stopped:
                     return
                 scheduling_stopped = True
-                for pending, (_index, pending_batch) in future_batches.items():
-                    if pending.cancel():
-                        failed_symbols.update(task[0] for task in pending_batch)
+                for pending in future_batches:
+                    pending.cancel()
 
             completed_batches = 0
             cancelled_batches = 0
@@ -374,17 +568,14 @@ class DataEngine:
                 batch_index, batch = future_batches[future]
                 if future.cancelled():
                     cancelled_batches += 1
-                    failed_symbols.update(task[0] for task in batch)
                     continue
                 try:
                     result = future.result()
                 except CancelledError:
                     cancelled_batches += 1
-                    failed_symbols.update(task[0] for task in batch)
                     continue
                 except Exception as exc:
                     completed_batches += 1
-                    failed_symbols.update(task[0] for task in batch)
                     batch_errors.append(str(exc))
                     logger.warning(
                         "行情批次进度 %d/%d：批次 %d/%d 异常：%s",
@@ -399,7 +590,6 @@ class DataEngine:
 
                 completed_batches += 1
                 results.append(result)
-                failed_symbols.update(result.failed_symbols)
                 batch_errors.extend(result.errors[:3])
                 logger.info(
                     "行情批次进度 %d/%d：批次 %d/%d 完成，有效行=%d，失败股票=%d",
@@ -426,23 +616,136 @@ class DataEngine:
                 )
 
         all_rows = [row for result in results for row in result.rows]
-        df = pd.DataFrame(
-            all_rows,
-            columns=["symbol", "date", "open", "high", "low", "close", "volume", "turnover"],
-        )
+        df = _normalize_daily_rows(all_rows, today_str)
+        df = df[df["symbol"].isin(symbols)]
         if not df.empty:
-            for col in ["open", "high", "low", "close", "volume", "turnover"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            df["date"] = df["date"].astype(str)
-            df = df.dropna(subset=["close", "volume"])
-            df = df[(df["close"] > 0) & (df["volume"] > 0) & (df["date"] <= today_str)]
-            df = df.drop_duplicates(subset=["symbol", "date"], keep="last")
+            df["requested_start"] = df["symbol"].map(requested_start_dates)
+            df = df[df["date"] >= df["requested_start"]].drop(columns=["requested_start"])
+        received_current = set(df.loc[df["date"] == today_str, "symbol"].astype(str))
 
-        received_current = (
-            set(df.loc[df["date"] == today_str, "symbol"].astype(str))
-            if not df.empty
-            else set()
-        )
+        missing_symbols = set(symbols) - received_current
+        if missing_symbols:
+            logger.warning(
+                "BaoStock 行情缺少 %d/%d 只目标日有效数据，改用 AKShare 腾讯日线补取",
+                len(missing_symbols),
+                expected_count,
+            )
+            fallback_tasks = [task for task in tasks if task[0] in missing_symbols]
+            fallback_payloads = []
+            fallback_timeout_by_symbol: dict[str, int] = {}
+            request_timeout = min(
+                15.0, float(self.settings.baostock_socket_timeout_seconds)
+            )
+            for task in fallback_tasks:
+                start_date = date.fromisoformat(task[2])
+                end_date = date.fromisoformat(task[3])
+                year_span = end_date.year - start_date.year + 1
+                attempts = self.settings.baostock_max_attempts
+                backoff_budget = sum(
+                    self.settings.baostock_backoff_seconds * (2**attempt)
+                    for attempt in range(max(0, attempts - 1))
+                )
+                estimated_timeout = int(year_span * request_timeout * attempts + backoff_budget + 5)
+                task_timeout = min(
+                    1800,
+                    max(self.settings.baostock_batch_timeout_seconds, estimated_timeout),
+                )
+                fallback_payloads.append(
+                    (
+                        [task],
+                        attempts,
+                        self.settings.baostock_backoff_seconds,
+                        request_timeout,
+                    )
+                )
+                fallback_timeout_by_symbol[task[0]] = task_timeout
+
+            fallback_results: list[BatchResult] = []
+            fallback_workers = min(self.settings.baostock_max_workers, len(fallback_payloads))
+            with ThreadPoolExecutor(max_workers=fallback_workers) as executor:
+                future_batches = {
+                    executor.submit(
+                        _run_akshare_batch_with_timeout,
+                        payload,
+                        fallback_timeout_by_symbol[payload[0][0][0]],
+                    ): payload[0][0][0]
+                    for payload in fallback_payloads
+                }
+                fallback_failure_streak = 0
+                for future in as_completed(future_batches):
+                    if future.cancelled():
+                        continue
+                    symbol = future_batches[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = BatchResult(
+                            [],
+                            [symbol],
+                            [f"{symbol}: {type(exc).__name__}: {exc}"],
+                        )
+                    fallback_results.append(result)
+                    batch_errors.extend(result.errors[:3])
+                    errors_text = " ".join(result.errors).lower()
+                    fatal_markers = (
+                        "timeout",
+                        "timed out",
+                        "connection",
+                        "network",
+                        "proxy",
+                        "remote",
+                        "refused",
+                        "unreachable",
+                        "no module named",
+                        "has no attribute",
+                        "worker failed",
+                        "worker exited",
+                        "接收",
+                        "连接",
+                        "远程主机",
+                    )
+                    if not result.rows and any(marker in errors_text for marker in fatal_markers):
+                        fallback_failure_streak += 1
+                    else:
+                        fallback_failure_streak = 0
+                    completed_fallbacks = len(fallback_results)
+                    if (
+                        completed_fallbacks == 1
+                        or completed_fallbacks % 25 == 0
+                        or completed_fallbacks == len(fallback_payloads)
+                    ):
+                        logger.info(
+                            "AKShare 备用行情进度 %d/%d：最近=%s，有效行=%d，失败=%d",
+                            completed_fallbacks,
+                            len(fallback_payloads),
+                            symbol,
+                            len(result.rows),
+                            len(result.failed_symbols),
+                        )
+                    if fallback_failure_streak >= fallback_workers:
+                        logger.error(
+                            "连续 %d 个 AKShare 请求出现网络故障，停止排队中的备用批次",
+                            fallback_failure_streak,
+                        )
+                        for pending in future_batches:
+                            if pending is not future:
+                                pending.cancel()
+
+            fallback_rows = [row for result in fallback_results for row in result.rows]
+            fallback_df = _normalize_daily_rows(fallback_rows, today_str)
+            fallback_df = fallback_df[fallback_df["symbol"].isin(missing_symbols)]
+            if not fallback_df.empty:
+                fallback_df["requested_start"] = fallback_df["symbol"].map(requested_start_dates)
+                fallback_df = fallback_df[
+                    fallback_df["date"] >= fallback_df["requested_start"]
+                ].drop(columns=["requested_start"])
+            if not fallback_df.empty:
+                # Keep valid primary rows when both providers returned the same date.
+                df = pd.concat([fallback_df, df], ignore_index=True)
+                df = df.drop_duplicates(subset=["symbol", "date"], keep="last")
+            received_current = set(df.loc[df["date"] == today_str, "symbol"].astype(str))
+
+        unresolved_symbols = set(symbols) - received_current
         # Validate only rows returned by this run. Cached today's rows are not
         # trusted because an earlier workflow may have run before market close.
         coverage = len(received_current) / expected_count
@@ -454,12 +757,12 @@ class DataEngine:
                 today_str,
                 coverage * 100,
                 minimum * 100,
-                len(failed_symbols),
+                len(unresolved_symbols),
                 expected_count,
             )
             raise DataIntegrityError(
                 f"{today_str} 行情覆盖率 {coverage:.2%} 低于门槛 {minimum:.2%}；"
-                f"失败股票={len(failed_symbols)}；{error_summary}"
+                f"失败股票={len(unresolved_symbols)}；{error_summary}"
             )
 
         # Atomic publication: replace only after validation. Never delete an
@@ -492,16 +795,12 @@ class DataEngine:
             len(df),
             today_str,
             coverage * 100,
-            len(failed_symbols),
+            len(unresolved_symbols),
         )
         return len(df)
 
     def is_trading_day(self, target_date: date | None = None) -> bool:
-        """Check BaoStock's exchange calendar with bounded retries.
-
-        Calendar availability errors are never treated as a non-trading day:
-        after the configured attempts, raise so the caller can stop safely.
-        """
+        """Check BaoStock's calendar, then use a bounded AKShare calendar fallback."""
         import socket
 
         socket.setdefaulttimeout(self.settings.baostock_socket_timeout_seconds)
@@ -551,8 +850,42 @@ class DataEngine:
                     except Exception as exc:
                         logger.warning("BaoStock 交易日历检查后登出失败：%s", exc)
 
+        fallback_errors: list[str] = []
+        timeout_seconds = max(10, min(30, self.settings.baostock_socket_timeout_seconds * 2))
+        for attempt in range(max_attempts):
+            try:
+                calendar_dates = _run_akshare_calendar_with_timeout(timeout_seconds)
+                normalized_dates = sorted(
+                    {date.fromisoformat(str(value)).isoformat() for value in calendar_dates}
+                )
+                if not normalized_dates:
+                    raise RuntimeError("AKShare 交易日历为空")
+                if normalized_dates[-1] < target:
+                    raise RuntimeError(
+                        f"AKShare 日历只更新到 {normalized_dates[-1]}，无法确认 {target}"
+                    )
+                logger.warning(
+                    "BaoStock 交易日历不可用，已切换 AKShare/Sina；目标日期=%s",
+                    target,
+                )
+                return target in set(normalized_dates)
+            except Exception as exc:
+                fallback_errors.append(f"{type(exc).__name__}: {exc}")
+                if attempt + 1 < max_attempts:
+                    delay = backoff_seconds * (2**attempt)
+                    logger.warning(
+                        "AKShare 备用交易日历失败（%d/%d）：%s；%.1f 秒后重试",
+                        attempt + 1,
+                        max_attempts,
+                        exc,
+                        delay,
+                    )
+                    if delay:
+                        time.sleep(delay)
+
         raise DataIntegrityError(
-            f"BaoStock 无法读取 {target} 的交易日历，已尝试 {max_attempts} 次：{errors[-1]}"
+            f"BaoStock 与 AKShare 均无法核验 {target} 的交易日历；"
+            f"BaoStock={errors[-1]}；AKShare={fallback_errors[-1]}"
         )
 
     def backfill(self, symbols: list[str]) -> None:
@@ -699,16 +1032,21 @@ class DataEngine:
     # ── 股票列表 ──
 
     def get_all_symbols(self) -> list[str]:
-        """通过 baostock 获取全市场 A 股代码列表。"""
-        import baostock as bs
+        """Get the A-share universe from BaoStock, falling back to AKShare."""
+        import socket
 
-        lg = bs.login()
-        if lg.error_code != "0":
-            logger.error(f"baostock 登录失败: {lg.error_msg}")
-            return []
-
+        socket.setdefaulttimeout(self.settings.baostock_socket_timeout_seconds)
+        logged_in = False
         try:
+            import baostock as bs
+
+            lg = bs.login()
+            if lg.error_code != "0":
+                raise RuntimeError(f"BaoStock 登录失败：{lg.error_msg}")
+            logged_in = True
             rs = bs.query_stock_basic(code_name="", code="")
+            if rs.error_code != "0":
+                raise RuntimeError(f"BaoStock 股票列表查询失败：{rs.error_msg}")
             symbols = []
             while rs.next():
                 row = rs.get_row_data()
@@ -717,13 +1055,52 @@ class DataEngine:
                 stock_type = row[5]     # "1" = 股票
                 if status == "1" and stock_type == "1":
                     symbols.append(code.split(".")[1])  # 提取纯数字代码
+            if not symbols:
+                raise RuntimeError("BaoStock 股票列表为空")
             logger.info(f"获取股票列表完成，共 {len(symbols)} 只")
-            return symbols
-        except Exception as e:
-            logger.error(f"获取股票列表失败: {e}")
-            return []
+            return sorted(set(symbols))
+        except Exception as exc:
+            logger.warning("BaoStock 股票列表不可用，尝试 AKShare 备用名单：%s", exc)
         finally:
-            bs.logout()
+            if logged_in:
+                try:
+                    bs.logout()
+                except Exception as exc:
+                    logger.warning("BaoStock 股票列表查询后登出失败：%s", exc)
+
+        errors: list[str] = []
+        timeout_seconds = max(10, min(30, self.settings.baostock_socket_timeout_seconds * 2))
+        for attempt in range(self.settings.baostock_max_attempts):
+            try:
+                symbols = _run_akshare_symbols_with_timeout(timeout_seconds)
+                normalized = sorted(
+                    {
+                        str(symbol).strip().zfill(6)
+                        for symbol in symbols
+                        if str(symbol).strip().isdigit()
+                        and len(str(symbol).strip()) == 6
+                    }
+                )
+                if not normalized:
+                    raise RuntimeError("AKShare 股票列表没有有效的六位代码")
+                logger.warning("AKShare 备用股票列表完成，共 %d 只", len(normalized))
+                return normalized
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+                if attempt + 1 < self.settings.baostock_max_attempts:
+                    delay = self.settings.baostock_backoff_seconds * (2**attempt)
+                    logger.warning(
+                        "AKShare 备用股票列表失败（%d/%d）：%s；%.1f 秒后重试",
+                        attempt + 1,
+                        self.settings.baostock_max_attempts,
+                        exc,
+                        delay,
+                    )
+                    if delay:
+                        time.sleep(delay)
+        raise DataIntegrityError(
+            f"BaoStock 与 AKShare 均无法获取股票列表：{errors[-1]}"
+        )
 
     def get_local_symbols(self) -> list[str]:
         with sqlite3.connect(self.db_path) as conn:

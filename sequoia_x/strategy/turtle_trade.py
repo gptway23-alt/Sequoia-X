@@ -24,20 +24,28 @@ class TurtleTradeStrategy(BaseStrategy):
     _MIN_BARS: int = 21  # 至少需要 21 根 K 线（20日窗口 + 当日）
 
     def _get_market_caps(self, symbols: list[str]) -> dict[str, float]:
-        """通过 baostock 查询候选股票的流通市值（不复权收盘价 × 流通股本）。
+        """通过 BaoStock 查询流通市值，失败时用腾讯日线辅助排序。
 
         流通股本 = 成交量 / (换手率% / 100)
         流通市值 = 流通股本 × 不复权收盘价
         """
-        from datetime import date
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
 
-        import baostock as bs
-
-        today_str = date.today().strftime("%Y-%m-%d")
+        today_str = self.engine.verified_date or datetime.now(
+            ZoneInfo("Asia/Shanghai")
+        ).date().isoformat()
         market_caps: dict[str, float] = {}
+        logged_in = False
+        bs = None
 
-        bs.login()
         try:
+            import baostock as bs
+
+            login = bs.login()
+            if login.error_code != "0":
+                raise RuntimeError(f"BaoStock 登录失败：{login.error_msg}")
+            logged_in = True
             for symbol in symbols:
                 bs_code = self.engine._to_baostock_code(symbol)
                 rs = bs.query_history_k_data_plus(
@@ -48,6 +56,8 @@ class TurtleTradeStrategy(BaseStrategy):
                     frequency="d",
                     adjustflag="3",  # 不复权，真实价格
                 )
+                if rs.error_code != "0":
+                    raise RuntimeError(f"{symbol} 查询失败：{rs.error_msg}")
                 while rs.next():
                     row = rs.get_row_data()
                     try:
@@ -59,9 +69,55 @@ class TurtleTradeStrategy(BaseStrategy):
                             market_caps[symbol] = circulating_shares * close
                     except (ValueError, ZeroDivisionError):
                         continue
+            return market_caps
+        except Exception as exc:
+            logger.warning("BaoStock 流通市值排序数据不可用，改用 AKShare：%s", exc)
+            fallback_caps = self._get_market_caps_akshare(symbols, today_str)
+            return {**fallback_caps, **market_caps}
         finally:
-            bs.logout()
+            if logged_in and bs is not None:
+                try:
+                    bs.logout()
+                except Exception as exc:
+                    logger.warning("BaoStock 市值查询后登出失败：%s", exc)
 
+    @staticmethod
+    def _get_market_caps_akshare(
+        symbols: list[str], target_date: str
+    ) -> dict[str, float]:
+        """Use Tencent's unadjusted close, share volume, and turnover ratio for ordering."""
+        try:
+            import akshare as ak
+        except Exception as exc:
+            logger.warning("AKShare 流通市值备用模块不可用：%s", exc)
+            return {}
+
+        market_caps: dict[str, float] = {}
+        for symbol in symbols:
+            try:
+                frame = ak.stock_zh_a_hist_tx(
+                    symbol=symbol,
+                    start_date=target_date.replace("-", ""),
+                    end_date=target_date.replace("-", ""),
+                    adjust="",
+                    timeout=10,
+                )
+                if frame is None or frame.empty:
+                    continue
+                matching = frame[
+                    pd.to_datetime(frame["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+                    == target_date
+                ]
+                if matching.empty:
+                    continue
+                row = matching.iloc[-1]
+                close = float(row["close"])
+                volume = float(row["volume"])
+                turnover_ratio = float(row["turnover"])
+                if close > 0 and volume > 0 and turnover_ratio > 0:
+                    market_caps[symbol] = close * volume / turnover_ratio
+            except Exception as exc:
+                logger.debug("[%s] AKShare 流通市值获取失败：%s", symbol, exc)
         return market_caps
 
     def run(self) -> list[str]:
