@@ -3,7 +3,7 @@
 import sqlite3
 import multiprocessing
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -334,7 +334,7 @@ class DataEngine:
         results: list[BatchResult] = []
         failed_symbols: set[str] = set()
         batch_errors: list[str] = []
-        failed_batches = 0
+        failed_batch_streak = 0
         max_workers = min(self.settings.baostock_max_workers, len(batches))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_batches = {
@@ -346,18 +346,44 @@ class DataEngine:
                 for index, (payload, batch) in enumerate(zip(payloads, batches), start=1)
             }
 
+            scheduling_stopped = False
+
             def cancel_queued_batches() -> None:
+                nonlocal scheduling_stopped
+                if scheduling_stopped:
+                    return
+                scheduling_stopped = True
                 for pending, (_index, pending_batch) in future_batches.items():
                     if pending.cancel():
                         failed_symbols.update(task[0] for task in pending_batch)
 
             completed_batches = 0
+            cancelled_batches = 0
+
+            def note_full_batch_failure() -> None:
+                nonlocal failed_batch_streak
+                failed_batch_streak += 1
+                if failed_batch_streak >= max_workers:
+                    logger.error(
+                        "连续 %d 个行情批次全部失败，取消尚未开始的批次",
+                        failed_batch_streak,
+                    )
+                    cancel_queued_batches()
+
             for future in as_completed(future_batches):
                 batch_index, batch = future_batches[future]
-                completed_batches += 1
+                if future.cancelled():
+                    cancelled_batches += 1
+                    failed_symbols.update(task[0] for task in batch)
+                    continue
                 try:
                     result = future.result()
+                except CancelledError:
+                    cancelled_batches += 1
+                    failed_symbols.update(task[0] for task in batch)
+                    continue
                 except Exception as exc:
+                    completed_batches += 1
                     failed_symbols.update(task[0] for task in batch)
                     batch_errors.append(str(exc))
                     logger.warning(
@@ -368,12 +394,10 @@ class DataEngine:
                         len(batches),
                         exc,
                     )
-                    if not future.cancelled():
-                        failed_batches += 1
-                        if failed_batches >= max_workers:
-                            logger.error("多个行情批次全部失败，取消尚未开始的批次")
-                            cancel_queued_batches()
+                    note_full_batch_failure()
                     continue
+
+                completed_batches += 1
                 results.append(result)
                 failed_symbols.update(result.failed_symbols)
                 batch_errors.extend(result.errors[:3])
@@ -387,10 +411,19 @@ class DataEngine:
                     len(result.failed_symbols),
                 )
                 if len(result.failed_symbols) == len(batch):
-                    failed_batches += 1
-                    if failed_batches >= max_workers:
-                        logger.error("多个行情批次全部失败，取消尚未开始的批次")
-                        cancel_queued_batches()
+                    note_full_batch_failure()
+                else:
+                    # A successful or partially successful batch breaks the
+                    # global-outage streak; isolated failed batches stay isolated.
+                    failed_batch_streak = 0
+
+            if cancelled_batches:
+                logger.warning(
+                    "行情抓取实际完成 %d/%d 批，另有 %d 批因连续失败取消",
+                    completed_batches,
+                    len(batches),
+                    cancelled_batches,
+                )
 
         all_rows = [row for result in results for row in result.rows]
         df = pd.DataFrame(
