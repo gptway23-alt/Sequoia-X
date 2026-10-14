@@ -497,24 +497,63 @@ class DataEngine:
         return len(df)
 
     def is_trading_day(self, target_date: date | None = None) -> bool:
-        """Check BaoStock's exchange calendar; fail closed if unavailable."""
+        """Check BaoStock's exchange calendar with bounded retries.
+
+        Calendar availability errors are never treated as a non-trading day:
+        after the configured attempts, raise so the caller can stop safely.
+        """
+        import socket
+
+        socket.setdefaulttimeout(self.settings.baostock_socket_timeout_seconds)
         import baostock as bs
 
         target = (target_date or datetime.now(ZoneInfo("Asia/Shanghai")).date()).isoformat()
-        login = bs.login()
-        if login.error_code != "0":
-            raise DataIntegrityError(f"BaoStock 登录失败，无法读取交易日历：{login.error_msg}")
-        try:
-            result = bs.query_trade_dates(start_date=target, end_date=target)
-            if result.error_code != "0":
-                raise DataIntegrityError(f"BaoStock 交易日历查询失败：{result.error_msg}")
-            while result.next():
-                row = result.get_row_data()
-                if row and row[0] == target:
-                    return row[1] == "1"
-            raise DataIntegrityError(f"BaoStock 未返回 {target} 的交易日状态")
-        finally:
-            bs.logout()
+        max_attempts = self.settings.baostock_max_attempts
+        backoff_seconds = self.settings.baostock_backoff_seconds
+        errors: list[str] = []
+
+        for attempt in range(max_attempts):
+            logged_in = False
+            try:
+                login = bs.login()
+                if login.error_code != "0":
+                    raise RuntimeError(f"登录失败：{login.error_msg}")
+                logged_in = True
+
+                result = bs.query_trade_dates(start_date=target, end_date=target)
+                if result.error_code != "0":
+                    raise RuntimeError(f"交易日历查询失败：{result.error_msg}")
+
+                while result.next():
+                    row = result.get_row_data()
+                    if row and row[0] == target:
+                        if len(row) < 2 or row[1] not in {"0", "1"}:
+                            raise RuntimeError(f"交易日历返回了无效状态：{row!r}")
+                        return row[1] == "1"
+                raise RuntimeError(f"交易日历未返回 {target} 的交易日状态")
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+                if attempt + 1 < max_attempts:
+                    delay = backoff_seconds * (2**attempt)
+                    logger.warning(
+                        "BaoStock 交易日历检查失败（%d/%d）：%s；%.1f 秒后重试",
+                        attempt + 1,
+                        max_attempts,
+                        exc,
+                        delay,
+                    )
+                    if delay:
+                        time.sleep(delay)
+            finally:
+                if logged_in:
+                    try:
+                        bs.logout()
+                    except Exception as exc:
+                        logger.warning("BaoStock 交易日历检查后登出失败：%s", exc)
+
+        raise DataIntegrityError(
+            f"BaoStock 无法读取 {target} 的交易日历，已尝试 {max_attempts} 次：{errors[-1]}"
+        )
 
     def backfill(self, symbols: list[str]) -> None:
         """通过 baostock 批量回填历史日 K 线数据（后复权）。

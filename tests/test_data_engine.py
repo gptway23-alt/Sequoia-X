@@ -1,9 +1,12 @@
 """数据引擎属性测试。"""
 
+import socket
 import sqlite3
+import sys
 import tempfile
 from datetime import date, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -149,3 +152,70 @@ def test_published_market_data_excludes_unverified_symbols(monkeypatch) -> None:
                 )
             }
         assert today_symbols == set(symbols[:99])
+
+
+def test_trading_calendar_retries_transient_login_failure(monkeypatch) -> None:
+    class CalendarResult:
+        error_code = "0"
+        error_msg = ""
+
+        def __init__(self) -> None:
+            self._read = False
+
+        def next(self) -> bool:
+            if self._read:
+                return False
+            self._read = True
+            return True
+
+        def get_row_data(self) -> list[str]:
+            return ["2026-10-14", "1"]
+
+    class FakeBaoStock:
+        login_calls = 0
+        logout_calls = 0
+
+        def login(self):
+            self.login_calls += 1
+            if self.login_calls == 1:
+                return SimpleNamespace(error_code="1", error_msg="temporary timeout")
+            return SimpleNamespace(error_code="0", error_msg="")
+
+        def query_trade_dates(self, **_kwargs):
+            return CalendarResult()
+
+        def logout(self):
+            self.logout_calls += 1
+
+    fake_bs = FakeBaoStock()
+    monkeypatch.setitem(sys.modules, "baostock", fake_bs)
+    monkeypatch.setattr(socket, "setdefaulttimeout", lambda _timeout: None)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _seconds: None)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        assert engine.is_trading_day(date(2026, 10, 14)) is True
+
+    assert fake_bs.login_calls == 2
+    assert fake_bs.logout_calls == 1
+
+
+def test_trading_calendar_fails_closed_after_bounded_login_retries(monkeypatch) -> None:
+    class FakeBaoStock:
+        login_calls = 0
+
+        def login(self):
+            self.login_calls += 1
+            return SimpleNamespace(error_code="1", error_msg="network receive error")
+
+    fake_bs = FakeBaoStock()
+    monkeypatch.setitem(sys.modules, "baostock", fake_bs)
+    monkeypatch.setattr(socket, "setdefaulttimeout", lambda _timeout: None)
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _seconds: None)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        with pytest.raises(DataIntegrityError, match="已尝试 2 次"):
+            engine.is_trading_day(date(2026, 10, 14))
+
+    assert fake_bs.login_calls == 2
