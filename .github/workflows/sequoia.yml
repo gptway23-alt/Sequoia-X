@@ -24,7 +24,7 @@ jobs:
     env:
       GMAIL_USER: ${{ secrets.GMAIL_USER }}
       GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-      GMAIL_TO: "1044757346@qq.com,waygpt23@gmail.com"
+      GMAIL_TO: "1044757346@qq.com,gptway23@gmail.com"
 
       DB_PATH: data/sequoia_v2.db
       START_DATE: "2024-01-01"
