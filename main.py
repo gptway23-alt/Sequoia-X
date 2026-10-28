@@ -8,7 +8,7 @@
 import argparse
 import socket
 import sys
-from datetime import datetime, time
+from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
@@ -17,6 +17,7 @@ load_dotenv()
 socket.setdefaulttimeout(10.0)
 
 from sequoia_x.core.config import get_settings
+from sequoia_x.core.daily_schedule import latest_completed_weekday
 from sequoia_x.core.logger import get_logger
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.notify.email import EmailNotifier
@@ -55,7 +56,19 @@ def main() -> None:
         action="store_true",
         help="回填模式：通过 baostock 拉取全市场历史 K 线",
     )
+    parser.add_argument(
+        "--catch-up",
+        action="store_true",
+        help="处理最近已收盘的工作日（用于延迟的定时任务）",
+    )
+    parser.add_argument(
+        "--trade-date",
+        help="明确指定要处理的交易日，格式 YYYY-MM-DD",
+    )
     args = parser.parse_args()
+    if args.catch_up and args.trade_date:
+        parser.error("--catch-up 和 --trade-date 不能同时使用")
+
     notification_failures: list[str] = []
 
     try:
@@ -93,13 +106,54 @@ def main() -> None:
             logger.info("Sequoia-X V2 回填模式运行完成")
             return
 
-        if not _after_market_close():
+        shanghai_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        if args.trade_date:
+            try:
+                trade_date = date.fromisoformat(args.trade_date)
+            except ValueError:
+                parser.error("--trade-date 必须是有效的 YYYY-MM-DD 日期")
+            if trade_date > shanghai_now.date():
+                parser.error("--trade-date 不能是未来日期")
+        elif args.catch_up:
+            trade_date = latest_completed_weekday(shanghai_now)
+        elif _after_market_close(shanghai_now):
+            trade_date = shanghai_now.date()
+        else:
             logger.info("当前不在上海时间工作日 15:05 后的运行时段，跳过行情同步和选股")
             return
 
-        if not engine.is_trading_day():
-            logger.info("今日不是 A 股交易日，跳过行情同步和选股")
+        engine.verified_date = trade_date.isoformat()
+        logger.info("本次目标交易日：%s", trade_date.isoformat())
+
+        if engine.daily_run_completed(trade_date):
+            logger.info("目标交易日 %s 已成功完成，跳过重复运行", trade_date.isoformat())
             return
+
+        if not engine.is_trading_day(trade_date):
+            if args.catch_up:
+                # A weekday may still be an exchange holiday. Walk back to
+                # the most recent actual trading session so holidays do not
+                # prevent a delayed run from recovering the prior session.
+                candidate = trade_date
+                for _ in range(14):
+                    candidate = date.fromordinal(candidate.toordinal() - 1)
+                    while candidate.weekday() >= 5:
+                        candidate = date.fromordinal(candidate.toordinal() - 1)
+                    if engine.is_trading_day(candidate):
+                        trade_date = candidate
+                        engine.verified_date = trade_date.isoformat()
+                        logger.info("休市日回退后，本次目标交易日：%s", trade_date)
+                        break
+                else:
+                    logger.info("最近 14 个工作日内未找到可补跑的 A 股交易日，跳过")
+                    return
+            else:
+                logger.info("目标日期 %s 不是 A 股交易日，跳过行情同步和选股", trade_date)
+                return
+
+            if engine.daily_run_completed(trade_date):
+                logger.info("目标交易日 %s 已成功完成，跳过重复运行", trade_date.isoformat())
+                return
 
         # 4. 日常模式：检查并补齐股票池
         logger.info("检查本地股票池完整性...")
@@ -143,7 +197,7 @@ def main() -> None:
 
         # 5. 增量同步
         logger.info("开始刷新当日收盘日线...")
-        count = engine.sync_today_bulk(expected_symbols=all_symbols)
+        count = engine.sync_today_bulk(expected_symbols=all_symbols, target_date=trade_date)
         logger.info(f"行情校验完成，写入 {count} 条日线记录")
 
         # 6. 策略列表
@@ -203,11 +257,16 @@ def main() -> None:
                 strategy_name="DailySummary",
                 strategy_results=strategy_results,
                 verified_symbols=verified_symbols,
+                trade_date=trade_date,
             )
             if not sent:
                 notification_failures.append("DailySummary")
         else:
             logger.info("所有策略均无已核验选股结果，跳过邮件")
+
+        if not notification_failures:
+            engine.mark_daily_run_completed(trade_date)
+            logger.info("目标交易日 %s 已标记完成", trade_date.isoformat())
 
     except Exception:
         try:

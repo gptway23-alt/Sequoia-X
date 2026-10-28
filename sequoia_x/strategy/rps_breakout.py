@@ -16,7 +16,11 @@ class RpsBreakoutStrategy(BaseStrategy):
     def run(self) -> list[str]:
         try:
             with sqlite3.connect(self.engine.db_path) as conn:
-                df = pd.read_sql("SELECT symbol, date, close, high FROM stock_daily", conn)
+                df = pd.read_sql(
+                    "SELECT symbol, date, close, high FROM stock_daily WHERE date <= ?",
+                    conn,
+                    params=(getattr(self.engine, "verified_date", None) or "9999-12-31",),
+                )
         except Exception as exc:
             logger.error(f"读取数据库失败: {exc}")
             return []

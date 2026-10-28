@@ -23,6 +23,8 @@ BaoStock 不可用时，日线切换到 AKShare 的腾讯历史行情接口，�
 
 ```bash
 python main.py               # 日常模式：收盘后同步行情、校验覆盖率、运行策略并邮件推送
+python main.py --catch-up     # 延迟任务补跑最近已收盘的工作日
+python main.py --trade-date 2026-10-27  # 明确指定交易日重试
 python main.py --backfill     # 回填模式：通过 BaoStock 补充本地历史 K 线
 ```
 
@@ -83,10 +85,15 @@ python main.py --backfill
 python main.py
 ```
 
-日常模式会在收盘确认时点前自动跳过。建议配合 crontab 每个交易日收盘后执行：
+普通日常模式会在收盘确认时点前自动跳过。GitHub Actions 每日 19:15 运行，
+并在 20:37、22:37 及次日 00:37 重试尚未完成的最近交易日。程序会将目标交易日
+写入数据库；后续重试发现该日期已完整成功后会直接跳过，失败运行则保留重试机会。
+延迟到午夜后时，补跑会继续使用前一工作日作为目标日期，避免误认为任务已完成。
+
+自建 cron 可使用补跑模式：
 
 ```cron
-15 19 * * 1-5 cd /root/Sequoia-X && .venv/bin/python main.py >> log.txt 2>&1
+15 19 * * 1-5 cd /root/Sequoia-X && .venv/bin/python main.py --catch-up >> log.txt 2>&1
 ```
 
 ---

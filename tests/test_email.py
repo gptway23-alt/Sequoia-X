@@ -1,6 +1,7 @@
 """Tests for Gmail notification failure handling."""
 
 import smtplib
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 from sequoia_x.notify.email import EmailNotifier
@@ -68,6 +69,29 @@ def test_login_disconnect_retries_once(monkeypatch) -> None:
     assert len(attachments) == 1
     assert attachments[0].get_filename().endswith(".txt")
     assert attachments[0].get_content() == "000001\n"
+
+
+def test_daily_summary_uses_the_recovered_trade_date_for_deduplication(monkeypatch) -> None:
+    notifier = _configured_notifier(monkeypatch)
+    smtp = MagicMock()
+    smtp.__enter__.return_value = smtp
+    smtp.send_message.return_value = {}
+
+    with (
+        patch.object(notifier, "_message_was_sent", return_value=False),
+        patch("sequoia_x.notify.email.smtplib.SMTP_SSL", return_value=smtp),
+    ):
+        assert notifier.send(
+            ["000001"],
+            "DailySummary",
+            verified_symbols={"000001"},
+            strategy_results={"ExampleStrategy": ["000001"]},
+            trade_date=date(2026, 10, 26),
+        ) is True
+
+    message = smtp.send_message.call_args.args[0]
+    assert message["Message-ID"] == "<sequoia-x-2026-10-26-daily@example.com>"
+    assert "交易日期：2026-10-26" in message.get_content()
 
 
 def test_disconnect_after_submission_checks_sent_before_retry(monkeypatch) -> None:

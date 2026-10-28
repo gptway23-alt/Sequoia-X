@@ -2,9 +2,25 @@ name: Sequoia-X Daily
 
 on:
   workflow_dispatch:
+    inputs:
+      trade_date:
+        description: "Optional YYYY-MM-DD date to retry explicitly"
+        required: false
+        type: string
+      catch_up:
+        description: "Run the latest completed weekday session"
+        required: false
+        type: boolean
+        default: false
 
   schedule:
     - cron: "15 19 * * 1-5"
+      timezone: "Asia/Shanghai"
+    - cron: "37 20 * * 1-5"
+      timezone: "Asia/Shanghai"
+    - cron: "37 22 * * 1-5"
+      timezone: "Asia/Shanghai"
+    - cron: "37 0 * * *"
       timezone: "Asia/Shanghai"
 
 concurrency:
@@ -75,8 +91,17 @@ jobs:
           fi
 
       - name: Run Sequoia-X
+        env:
+          SEQUOIA_TRADE_DATE: ${{ inputs.trade_date }}
+          SEQUOIA_CATCH_UP: ${{ github.event_name == 'schedule' || inputs.catch_up }}
         run: |
-          python main.py
+          if [ -n "$SEQUOIA_TRADE_DATE" ]; then
+            python main.py --trade-date "$SEQUOIA_TRADE_DATE"
+          elif [ "$SEQUOIA_CATCH_UP" = "true" ]; then
+            python main.py --catch-up
+          else
+            python main.py
+          fi
 
       - name: Save database
         if: always()
