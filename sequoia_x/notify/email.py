@@ -6,7 +6,7 @@ import os
 import re
 import smtplib
 import time
-from datetime import datetime
+from datetime import date, datetime
 from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 
@@ -75,6 +75,7 @@ class EmailNotifier:
         webhook_key: str = "default",
         verified_symbols: set[str] | None = None,
         strategy_results: dict[str, list[str]] | None = None,
+        trade_date: date | str | None = None,
     ) -> bool:
         """Send a verified stock list with one bounded retry and Sent checking.
 
@@ -132,7 +133,12 @@ class EmailNotifier:
             logger.error("邮件未发送：缺少 GMAIL_USER、GMAIL_APP_PASSWORD 或收件人配置")
             return False
 
-        today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+        today = (
+            trade_date.isoformat()
+            if isinstance(trade_date, date)
+            else trade_date
+            or datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+        )
         domain = self.user.rsplit("@", 1)[-1]
         if strategy_results is not None:
             # One stable daily ID prevents duplicate summary emails on reruns.

@@ -36,6 +36,13 @@ _CREATE_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_symbol_date ON stock_daily (symbol, date);
 """
 
+_CREATE_DAILY_RUNS_SQL = """
+CREATE TABLE IF NOT EXISTS daily_runs (
+    trade_date   TEXT PRIMARY KEY,
+    completed_at TEXT NOT NULL
+);
+"""
+
 
 class DataIntegrityError(RuntimeError):
     """Raised when current-day market data is incomplete or cannot be verified."""
@@ -427,6 +434,7 @@ class DataEngine:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(_CREATE_TABLE_SQL)
             conn.execute(_CREATE_INDEX_SQL)
+            conn.execute(_CREATE_DAILY_RUNS_SQL)
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
@@ -455,11 +463,33 @@ class DataEngine:
             )
         with sqlite3.connect(self.db_path) as conn:
             df = pd.read_sql(
-                "SELECT * FROM stock_daily WHERE symbol = ? ORDER BY date",
+                "SELECT * FROM stock_daily WHERE symbol = ? AND date <= ? ORDER BY date",
                 conn,
-                params=(symbol,),
+                params=(symbol, self.verified_date or "9999-12-31"),
             )
         return df
+
+    def daily_run_completed(self, trade_date: date) -> bool:
+        """Return whether this session completed successfully in the cache DB."""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM daily_runs WHERE trade_date = ?",
+                (trade_date.isoformat(),),
+            ).fetchone()
+        return row is not None
+
+    def mark_daily_run_completed(self, trade_date: date) -> None:
+        """Persist a successful session marker for later scheduled retries."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO daily_runs (trade_date, completed_at) "
+                "VALUES (?, ?)",
+                (
+                    trade_date.isoformat(),
+                    datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
+                ),
+            )
+            conn.commit()
 
     @staticmethod
     def _to_baostock_code(symbol: str) -> str:

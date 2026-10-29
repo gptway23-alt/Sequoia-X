@@ -73,6 +73,36 @@ def _seed_daily_rows(engine: DataEngine, symbols: list[str], trade_date: date) -
         )
 
 
+def test_daily_run_completion_marker_persists_and_is_idempotent() -> None:
+    target_date = date(2026, 10, 27)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, settings = make_engine_in(tmp_dir)
+        assert engine.daily_run_completed(target_date) is False
+
+        engine.mark_daily_run_completed(target_date)
+        engine.mark_daily_run_completed(target_date)
+
+        restored_engine = DataEngine(settings)
+        assert restored_engine.daily_run_completed(target_date) is True
+        with sqlite3.connect(engine.db_path) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM daily_runs WHERE trade_date = ?",
+                (target_date.isoformat(),),
+            ).fetchone()[0]
+        assert count == 1
+
+
+def test_get_ohlcv_excludes_rows_after_target_trade_date() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        engine, _ = make_engine_in(tmp_dir)
+        _seed_daily_rows(engine, ["000001"], date(2026, 10, 15))
+        engine.verified_date = "2026-10-15"
+
+        history = engine.get_ohlcv("000001")
+
+        assert history["date"].tolist() == ["2026-10-14", "2026-10-15"]
+
+
 def _fake_executor(monkeypatch, returned_symbols: set[str], failed: set[str] | None = None) -> None:
     class FakeFuture:
         def __init__(self, result: BatchResult):

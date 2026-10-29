@@ -39,6 +39,7 @@ def test_email_failure_does_not_stop_later_strategies(monkeypatch) -> None:
     class FakeEngine:
         def __init__(self, settings) -> None:
             self.verified_symbols = {"000001"}
+            self.verified_date = None
 
         def get_all_symbols(self) -> list[str]:
             return ["000001"]
@@ -46,10 +47,21 @@ def test_email_failure_does_not_stop_later_strategies(monkeypatch) -> None:
         def get_local_symbols(self) -> list[str]:
             return ["000001"]
 
-        def is_trading_day(self) -> bool:
+        def daily_run_completed(self, trade_date) -> bool:
+            return False
+
+        def mark_daily_run_completed(self, trade_date) -> None:
+            self.completed_date = trade_date
+
+        def is_trading_day(self, target_date=None) -> bool:
             return True
 
-        def sync_today_bulk(self, expected_symbols: list[str] | None = None) -> int:
+        def sync_today_bulk(
+            self,
+            expected_symbols: list[str] | None = None,
+            target_date=None,
+        ) -> int:
+            self.verified_date = target_date.isoformat()
             return 1
 
     strategy_runs: list[str] = []
@@ -90,4 +102,30 @@ def test_email_failure_does_not_stop_later_strategies(monkeypatch) -> None:
         strategy_name="DailySummary",
         strategy_results={"FakeStrategy": ["000001"]},
         verified_symbols={"000001"},
+        trade_date=datetime.now(ZoneInfo("Asia/Shanghai")).date(),
     )
+
+
+def test_catch_up_skips_a_trade_date_already_completed(monkeypatch) -> None:
+    target_date = datetime(2026, 10, 27, tzinfo=ZoneInfo("Asia/Shanghai")).date()
+    monkeypatch.setattr(sys, "argv", ["main.py", "--catch-up"])
+
+    class CompletedEngine:
+        def __init__(self, settings) -> None:
+            self.verified_date = None
+
+        def daily_run_completed(self, trade_date) -> bool:
+            assert trade_date == target_date
+            return True
+
+    with (
+        patch.object(main_module, "get_settings", return_value=object()),
+        patch.object(main_module, "latest_completed_weekday", return_value=target_date),
+        patch.object(main_module, "DataEngine", CompletedEngine),
+        patch.object(main_module, "EmailNotifier") as notifier,
+        patch.object(main_module, "MaVolumeStrategy") as strategy,
+    ):
+        main_module.main()
+
+    notifier.assert_not_called()
+    strategy.assert_not_called()
