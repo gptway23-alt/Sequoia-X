@@ -1084,7 +1084,7 @@ class DataEngine:
     # ── 股票列表 ──
 
     def get_all_symbols(self) -> list[str]:
-        """Get the A-share universe from BaoStock, falling back to AKShare."""
+        """Get the A-share universe from providers, then a recent verified cache."""
         import socket
 
         socket.setdefaulttimeout(self.settings.baostock_socket_timeout_seconds)
@@ -1092,27 +1092,33 @@ class DataEngine:
         try:
             import baostock as bs
 
-            lg = bs.login()
-            if lg.error_code != "0":
-                raise RuntimeError(f"BaoStock 登录失败：{lg.error_msg}")
+            login = bs.login()
+            if login.error_code != "0":
+                raise RuntimeError(f"BaoStock 登录失败：{login.error_msg}")
             logged_in = True
-            rs = bs.query_stock_basic(code_name="", code="")
-            if rs.error_code != "0":
-                raise RuntimeError(f"BaoStock 股票列表查询失败：{rs.error_msg}")
+
+            result = bs.query_stock_basic(code_name="", code="")
+            if result.error_code != "0":
+                raise RuntimeError(f"BaoStock 股票列表查询失败：{result.error_msg}")
+
             symbols = []
-            while rs.next():
-                row = rs.get_row_data()
+            while result.next():
+                row = result.get_row_data()
                 code = row[0]           # "sh.600000" or "sz.000001"
                 status = row[4]         # "1" = 上市
                 stock_type = row[5]     # "1" = 股票
                 if status == "1" and stock_type == "1":
-                    symbols.append(code.split(".")[1])  # 提取纯数字代码
+                    symbols.append(code.split(".")[1])
+
             if not symbols:
                 raise RuntimeError("BaoStock 股票列表为空")
-            logger.info(f"获取股票列表完成，共 {len(symbols)} 只")
+
+            logger.info("获取股票列表完成，共 %d 只", len(symbols))
             return sorted(set(symbols))
+
         except Exception as exc:
             logger.warning("BaoStock 股票列表不可用，尝试 AKShare 备用名单：%s", exc)
+
         finally:
             if logged_in:
                 try:
@@ -1121,7 +1127,11 @@ class DataEngine:
                     logger.warning("BaoStock 股票列表查询后登出失败：%s", exc)
 
         errors: list[str] = []
-        timeout_seconds = max(10, min(30, self.settings.baostock_socket_timeout_seconds * 2))
+        timeout_seconds = max(
+            10,
+            min(30, self.settings.baostock_socket_timeout_seconds * 2),
+        )
+
         for attempt in range(self.settings.baostock_max_attempts):
             try:
                 symbols = _run_akshare_symbols_with_timeout(timeout_seconds)
@@ -1135,8 +1145,10 @@ class DataEngine:
                 )
                 if not normalized:
                     raise RuntimeError("AKShare 股票列表没有有效的六位代码")
-                logger.warning("AKShare 备用股票列表完成，共 %d 只", len(normalized))
+
+                logger.info("AKShare 股票列表获取完成，共 %d 只", len(normalized))
                 return normalized
+
             except Exception as exc:
                 errors.append(f"{type(exc).__name__}: {exc}")
                 if attempt + 1 < self.settings.baostock_max_attempts:
@@ -1150,6 +1162,75 @@ class DataEngine:
                     )
                     if delay:
                         time.sleep(delay)
+
+        # Both live providers failed. Reuse a recent universe only when it was
+        # recorded by a fully completed run and contains at least 4,000 symbols.
+        target_date = self.verified_date or datetime.now(
+            ZoneInfo("Asia/Shanghai")
+        ).date().isoformat()
+        cached_date = None
+        age_days = None
+        cached_symbols: list[str] = []
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT r.trade_date
+                    FROM daily_runs AS r
+                    JOIN stock_daily AS s ON s.date = r.trade_date
+                    WHERE r.trade_date < ?
+                    GROUP BY r.trade_date
+                    HAVING COUNT(DISTINCT s.symbol) >= 4000
+                    ORDER BY r.trade_date DESC
+                    LIMIT 1
+                    """,
+                    (target_date,),
+                ).fetchone()
+
+                if row:
+                    cached_date = str(row[0])
+                    age_days = (
+                        date.fromisoformat(target_date)
+                        - date.fromisoformat(cached_date)
+                    ).days
+                    rows = conn.execute(
+                        "SELECT DISTINCT symbol FROM stock_daily WHERE date = ?",
+                        (cached_date,),
+                    ).fetchall()
+                    cached_symbols = sorted(
+                        {
+                            str(item[0]).strip().zfill(6)
+                            for item in rows
+                            if str(item[0]).strip().isdigit()
+                            and len(str(item[0]).strip()) == 6
+                        }
+                    )
+
+        except (sqlite3.Error, ValueError) as exc:
+            logger.warning("读取本地已验证股票池失败：%s", exc)
+
+        if (
+            cached_date is not None
+            and age_days is not None
+            and 0 < age_days <= 7
+            and len(cached_symbols) >= 4000
+        ):
+            logger.warning(
+                "在线股票名单不可用，改用最近成功交易日 %s 的缓存股票池（%d 只）；"
+                "缓存日期之后新上市的股票可能未包含",
+                cached_date,
+                len(cached_symbols),
+            )
+            return cached_symbols
+
+        logger.warning(
+            "没有符合条件的近期已验证股票池：缓存日期=%s，距目标日=%s天，"
+            "有效股票数=%d；将停止运行",
+            cached_date,
+            age_days,
+            len(cached_symbols),
+        )
         raise DataIntegrityError(
             f"BaoStock 与 AKShare 均无法获取股票列表：{errors[-1]}"
         )
