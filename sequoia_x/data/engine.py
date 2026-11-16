@@ -114,13 +114,35 @@ def _akshare_fetch_batch(payload: tuple) -> BatchResult:
 
 
 def _akshare_calendar_dates(_payload: object = None) -> list[str]:
-    """Read the Sina exchange calendar via AKShare and return ISO date strings."""
+    """Read the Sina exchange calendar across AKShare's 1.20.45 API rename."""
     import akshare as ak
 
-    frame = ak.tool_trade_date_hist_sina()
-    if frame is None or frame.empty or "trade_date" not in frame.columns:
-        raise RuntimeError("Sina trade calendar is empty or has no trade_date column")
-    parsed = pd.to_datetime(frame["trade_date"], errors="coerce").dropna()
+    # AKShare 1.20.45 renamed tool_trade_date_hist_sina to
+    # calendar_trade_date_hist_sina and removed the old attribute. Prefer the
+    # current public name, while retaining compatibility with locked older
+    # installations (for example 1.18.x).
+    calendar_api = getattr(ak, "calendar_trade_date_hist_sina", None)
+    if calendar_api is None:
+        calendar_api = getattr(ak, "tool_trade_date_hist_sina", None)
+    if calendar_api is None:
+        raise RuntimeError("AKShare has no supported Sina trade-calendar interface")
+
+    frame = calendar_api()
+    if frame is None or frame.empty:
+        raise RuntimeError("Sina trade calendar is empty")
+    date_column = next(
+        (
+            name
+            for name in ("trade_date", "date", "交易日期", "日期")
+            if name in frame.columns
+        ),
+        None,
+    )
+    if date_column is None:
+        raise RuntimeError(
+            f"Sina trade calendar has no recognized date column: {list(frame.columns)!r}"
+        )
+    parsed = pd.to_datetime(frame[date_column], errors="coerce").dropna()
     dates = sorted({value.date().isoformat() for value in parsed})
     if not dates:
         raise RuntimeError("Sina trade calendar contains no valid dates")
